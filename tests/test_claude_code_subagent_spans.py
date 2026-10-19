@@ -81,6 +81,7 @@ def _launch(
     prompts: dict[str, str] | None = None,
     function: str = "Agent",
     main_task: str = MAIN_TASK,
+    subagent_type: str = "Explore",
 ) -> None:
     prompts = prompts or {"toolu_1": PROMPT}
     _call(
@@ -91,7 +92,7 @@ def _launch(
                 ToolCall(
                     id=tool_use_id,
                     function=function,
-                    arguments={"prompt": prompt, "subagent_type": "Explore"},
+                    arguments={"prompt": prompt, "subagent_type": subagent_type},
                 )
                 for tool_use_id, prompt in prompts.items()
             ],
@@ -178,7 +179,9 @@ def test_foreground_subagent_span_closes_on_tool_result(
         _tool_result_line("Found 3 TODOs", {"status": "completed", "prompt": PROMPT})
     )
     assert [e.id for e in stub.span_ends()] == [begin.id]
-    assert _subagent_call(consumer).span_id == "outer"
+    assert (
+        _subagent_call(consumer).span_id == begin.id
+    )  # a late call stays with its run
 
 
 def test_background_subagent_stays_in_own_span_after_launch_ack(
@@ -199,7 +202,7 @@ def test_background_subagent_stays_in_own_span_after_launch_ack(
 
     consumer.process_jsonl_line(TASK_NOTIFICATION)
     assert [e.id for e in stub.span_ends()] == [begin.id]
-    assert _subagent_call(consumer).span_id == "outer"
+    assert _subagent_call(consumer).span_id == begin.id
 
 
 def test_background_ack_detected_from_text_without_structured_result(
@@ -252,14 +255,14 @@ def test_notification_before_ack(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer.process_jsonl_line(TASK_NOTIFICATION)
     consumer.process_jsonl_line(ASYNC_ACK)
     assert _ends(stub) == ["agent-toolu_1"]
-    assert _subagent_call(consumer).span_id == "outer"
+    assert _subagent_call(consumer).span_id == "agent-toolu_1"
 
 
 def test_unknown_notification_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer, stub = _consumer(monkeypatch)
     _launch(consumer)
     consumer.process_jsonl_line(ASYNC_ACK)
-    consumer.process_jsonl_line(_notification(tool_use_id="toolu_other"))
+    consumer.process_jsonl_line(_notification(tool_use_id="toolu_x", task_id="zzz"))
     consumer.process_jsonl_line(_notification(tool_use_id=None, task_id="zzz"))
     assert _ends(stub) == []
 
@@ -285,7 +288,7 @@ def test_concurrent_background_agents(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer.process_jsonl_line(_notification("toolu_2", "d4e5f6"))
     assert _ends(stub) == ["agent-toolu_2"]
     assert _subagent_call(consumer, PROMPT).span_id == "agent-toolu_1"
-    assert _subagent_call(consumer, PROMPT_2).span_id == "outer"
+    assert _subagent_call(consumer, PROMPT_2).span_id == "agent-toolu_2"
 
 
 def test_remote_launched_closes_at_launch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -494,7 +497,7 @@ def test_fork_attributed_by_fork_started_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     consumer, stub = _consumer(monkeypatch)
-    _launch(consumer, function="Agent")
+    _launch(consumer, subagent_type="fork")
     consumer.process_jsonl_line(ASYNC_ACK)
     launch = ChatMessageAssistant(
         content="",
@@ -532,3 +535,265 @@ def test_fork_attributed_by_fork_started_result(
         ),
     )
     assert parent.span_id == "outer"
+
+
+# ---------------------------------------------------------------------------
+# forks launched together, resume edge cases (independent review findings)
+# ---------------------------------------------------------------------------
+
+
+def _launch_many(
+    consumer: LiveConsumer, agents: dict[str, tuple[str, str]], extra: bool = False
+) -> None:
+    calls = [
+        ToolCall(id=i, function="Agent", arguments={"prompt": p, "subagent_type": t})
+        for i, (p, t) in agents.items()
+    ]
+    if extra:
+        calls.append(ToolCall(id="toolu_bash", function="Bash", arguments={}))
+    _call(consumer, _model_event([ChatMessageUser(content=MAIN_TASK)], calls))
+
+
+def _fork_input(ids: list[str], directive: str) -> list[ChatMessage]:
+    launch = ChatMessageAssistant(
+        content="",
+        tool_calls=[ToolCall(id=i, function="Agent", arguments={}) for i in ids],
+    )
+    return [
+        ChatMessageUser(content=MAIN_TASK),
+        launch,
+        *[
+            ChatMessageTool(
+                content="Fork started — processing in background", tool_call_id=i
+            )
+            for i in ids
+        ],
+        ChatMessageUser(content=f"<fork-boilerplate/>\nYour directive: {directive}"),
+    ]
+
+
+def _send(consumer: LiveConsumer, send_id: str, to: str) -> None:
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=MAIN_TASK)],
+            [ToolCall(id=send_id, function="SendMessage", arguments={"to": to})],
+        ),
+    )
+
+
+def _started(task_id: str, tool_use_id: str, run_id: str) -> dict[str, Any]:
+    return {
+        "type": "system",
+        "subtype": "task_started",
+        "task_id": task_id,
+        "tool_use_id": tool_use_id,
+        "run_id": run_id,
+    }
+
+
+def test_parallel_forks_pick_their_own_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, _ = _consumer(monkeypatch)
+    _launch_many(consumer, {"t1": (PROMPT, "fork"), "t2": (PROMPT_2, "fork")})
+    for directive, span in ((PROMPT, "agent-t1"), (PROMPT_2, "agent-t2")):
+        call = _call(consumer, _model_event(_fork_input(["t1", "t2"], directive)))
+        assert call.span_id == span
+
+
+def test_fork_beside_regular_agent_and_bash(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, _ = _consumer(monkeypatch)
+    _launch_many(
+        consumer, {"t1": (PROMPT, "fork"), "t2": (PROMPT_2, "Explore")}, extra=True
+    )
+    call = _call(
+        consumer, _model_event(_fork_input(["t1", "t2", "toolu_bash"], PROMPT))
+    )
+    assert call.span_id == "agent-t1"
+
+
+def test_nested_fork_goes_to_innermost(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch_many(consumer, {"t1": (PROMPT, "fork")})
+    outer_fork = _fork_input(["t1"], PROMPT)
+    _call(
+        consumer,
+        _model_event(
+            outer_fork,
+            [
+                ToolCall(
+                    id="t2",
+                    function="Agent",
+                    arguments={"prompt": PROMPT_2, "subagent_type": "fork"},
+                )
+            ],
+        ),
+    )
+    assert stub.span_begins()[-1].parent_id == "agent-t1"
+    inner = outer_fork + _fork_input(["t2"], PROMPT_2)[1:]
+    assert _call(consumer, _model_event(inner)).span_id == "agent-t2"
+
+
+def test_resumed_fork_uses_new_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch_many(consumer, {"t1": (PROMPT, "fork")})
+    consumer.process_jsonl_line(_async_ack("t1", agent_id="aid"))
+    consumer.process_jsonl_line(_notification("t1", "aid"))
+    _send(consumer, "s1", "aid")
+    history = _fork_input(["t1"], PROMPT) + [
+        ChatMessageAssistant(content="done"),
+        ChatMessageUser(content="more"),
+    ]
+    assert _call(consumer, _model_event(history)).span_id == "agent-t1-run2"
+
+
+def test_failed_send_message_closes_its_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    consumer.process_jsonl_line(_notification(task_id="aid"))
+    _send(consumer, "s1", "aid")
+    line = _tool_result_line(
+        "<tool_use_error>Error: no agent</tool_use_error>", None, "s1"
+    )
+    line["message"]["content"][0]["is_error"] = True
+    consumer.process_jsonl_line(line)
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+    # a later, valid resume still gets a span
+    _send(consumer, "s2", "aid")
+    assert stub.span_begins()[-1].id == "agent-toolu_1-run3"
+
+
+def test_resumed_run_closes_on_task_id_only_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    consumer.process_jsonl_line(_notification(None, "aid"))
+    _send(consumer, "s1", "aid")
+    consumer.process_jsonl_line(_notification(None, "aid"))
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_foreground_agent_resumable_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r1"))
+    consumer.process_jsonl_line(
+        _tool_result_line(
+            "21 lines\nagentId: aid", {"status": "completed", "prompt": PROMPT}
+        )
+    )
+    _send(consumer, "s1", "aid")
+    assert stub.span_begins()[-1].id == "agent-toolu_1-run2"
+
+
+def test_resumed_call_before_notification_rolls_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # seen in a real run: the resumed run's first call reaches the bridge
+    # before the previous run's notification reaches the stdout reader
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r1"))
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="21"),
+        ChatMessageUser(content="queued message"),
+    ]
+    assert _call(consumer, _model_event(resumed)).span_id == "agent-toolu_1-run2"
+
+    # the late notification for run 1 must not close run 2
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r1"})
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r2"))
+    assert _ends(stub) == ["agent-toolu_1"]
+    assert _call(consumer, _model_event(resumed)).span_id == "agent-toolu_1-run2"
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r2"})
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_lagging_send_message_keys_rolled_over_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    _send(consumer, "s1", "aid")  # run 1's notification not read yet
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="21"),
+        ChatMessageUser(content="more"),
+    ]
+    assert _call(consumer, _model_event(resumed)).span_id == "agent-toolu_1-run2"
+    consumer.process_jsonl_line(_notification("s1", "aid"))
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_reset_closes_resumed_run_and_keeps_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    consumer.process_jsonl_line(_notification(task_id="aid"))
+    _send(consumer, "s1", "aid")
+    consumer.reset()
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+    # a retry resumes the session, which can still message the agent
+    _send(consumer, "s2", "aid")
+    assert stub.span_begins()[-1].id == "agent-toolu_1-run3"
+
+
+def test_same_name_prefers_callers_own_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=MAIN_TASK)],
+            [
+                ToolCall(
+                    id="t1", function="Agent", arguments={"prompt": PROMPT, "name": "w"}
+                )
+            ],
+        ),
+    )
+    # sub-agent t1 launches its own "w"
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=PROMPT)],
+            [
+                ToolCall(
+                    id="t2",
+                    function="Agent",
+                    arguments={"prompt": PROMPT_2, "name": "w"},
+                )
+            ],
+        ),
+    )
+    consumer.process_jsonl_line(_tool_result_line("done", None, "t2"))
+    consumer.process_jsonl_line(_tool_result_line("done", None, "t1"))
+    _send(consumer, "s1", "w")  # from the main agent
+    assert stub.span_begins()[-1].id == "agent-t1-run2"
+
+
+def test_queued_message_resume_after_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    # real 2.1.303 trace: SendMessage while the agent runs (queued), run 1's
+    # notification closes it, then Claude Code resumes it under the launch id
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r1"))
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    _send(consumer, "s1", "aid")
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r1"})
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="21"),
+        ChatMessageUser(content="The coordinator sent a message: count /etc/group"),
+    ]
+    assert _call(consumer, _model_event(resumed)).span_id == "agent-toolu_1-run2"
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r2"))
+    assert len(stub.span_begins()) == 2
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r2"})
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
