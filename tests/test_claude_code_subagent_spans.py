@@ -15,6 +15,7 @@ from inspect_ai.model import GenerateConfig, ModelOutput
 from inspect_ai.model._chat_message import (
     ChatMessage,
     ChatMessageAssistant,
+    ChatMessageTool,
     ChatMessageUser,
 )
 from inspect_ai.tool import ToolCall
@@ -355,3 +356,179 @@ def test_verbatim_delegation_attributes_to_subagent(
     consumer, stub = _consumer(monkeypatch)
     _launch(consumer, main_task=PROMPT)
     assert _subagent_call(consumer).span_id == "agent-toolu_1"
+
+
+# Shapes below are from real Claude Code 2.1.303 runs (claude-haiku-4-5).
+AGENT_ID = "a6b8c22231413918c"
+
+
+def _resume_call(
+    consumer: LiveConsumer, send_id: str, to: str = AGENT_ID
+) -> ModelEvent:
+    return _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=MAIN_TASK)],
+            [
+                ToolCall(
+                    id=send_id,
+                    function="SendMessage",
+                    arguments={"to": to, "message": "Now count /etc/group."},
+                )
+            ],
+        ),
+    )
+
+
+def _resumed_subagent_call(consumer: LiveConsumer) -> ModelEvent:
+    return _call(
+        consumer,
+        _model_event(
+            [
+                ChatMessageUser(content=PROMPT),
+                ChatMessageAssistant(content="21 lines."),
+                ChatMessageUser(
+                    content="The coordinator sent a message while you were "
+                    "working:\nNow count /etc/group."
+                ),
+            ]
+        ),
+    )
+
+
+def _finished_background_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[LiveConsumer, _TranscriptStub]:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id=AGENT_ID))
+    consumer.process_jsonl_line(_notification(task_id=AGENT_ID))
+    return consumer, stub
+
+
+def test_send_message_resume_opens_new_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _finished_background_agent(monkeypatch)
+    _resume_call(consumer, "toolu_send")
+    begin = stub.span_begins()[-1]
+    assert (begin.id, begin.name, begin.parent_id) == (
+        "agent-toolu_1-run2",
+        "Explore",
+        "outer",
+    )
+    assert begin.metadata == {"resumes": "agent-toolu_1"}
+
+    # the SendMessage result ("Resuming agent …") does not close it
+    consumer.process_jsonl_line(
+        _tool_result_line(
+            '{"success":true,"message":"Resuming agent a6b8c22"}',
+            {"success": True, "resumedAgentId": AGENT_ID},
+            "toolu_send",
+        )
+    )
+    assert _resumed_subagent_call(consumer).span_id == "agent-toolu_1-run2"
+    # the duplicate task_started for this run does not open another span
+    consumer.process_jsonl_line(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": AGENT_ID,
+            "tool_use_id": "toolu_send",
+        }
+    )
+    assert len(stub.span_begins()) == 2
+
+    consumer.process_jsonl_line(_notification("toolu_send", AGENT_ID))
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_send_message_by_name_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=MAIN_TASK)],
+            [
+                ToolCall(
+                    id="toolu_1",
+                    function="Agent",
+                    arguments={"prompt": PROMPT, "name": "counter"},
+                )
+            ],
+        ),
+    )
+    consumer.process_jsonl_line(_async_ack(agent_id=AGENT_ID))
+    consumer.process_jsonl_line(_notification(task_id=AGENT_ID))
+    _resume_call(consumer, "toolu_send", to="counter")
+    assert stub.span_begins()[-1].id == "agent-toolu_1-run2"
+
+
+def test_send_message_to_running_agent_opens_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id=AGENT_ID))
+    _resume_call(consumer, "toolu_send")
+    assert len(stub.span_begins()) == 1
+
+
+def test_task_started_reopens_resumed_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a message queued while the agent ran makes Claude Code resume it after
+    # its notification, under the original tool_use_id
+    consumer, stub = _finished_background_agent(monkeypatch)
+    consumer.process_jsonl_line(
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": AGENT_ID,
+            "tool_use_id": "toolu_1",
+        }
+    )
+    assert stub.span_begins()[-1].id == "agent-toolu_1-run2"
+    assert _resumed_subagent_call(consumer).span_id == "agent-toolu_1-run2"
+    consumer.process_jsonl_line(_notification("toolu_1", AGENT_ID))
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_fork_attributed_by_fork_started_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer, function="Agent")
+    consumer.process_jsonl_line(ASYNC_ACK)
+    launch = ChatMessageAssistant(
+        content="",
+        tool_calls=[ToolCall(id="toolu_1", function="Agent", arguments={})],
+    )
+    fork = _call(
+        consumer,
+        _model_event(
+            [
+                ChatMessageUser(content=MAIN_TASK),
+                launch,
+                ChatMessageTool(
+                    content="Fork started — processing in background",
+                    tool_call_id="toolu_1",
+                ),
+                ChatMessageUser(
+                    content="<fork-boilerplate>…</fork-boilerplate>\n\n"
+                    f"Your directive: {PROMPT}"
+                ),
+            ]
+        ),
+    )
+    assert fork.span_id == "agent-toolu_1"
+    parent = _call(
+        consumer,
+        _model_event(
+            [
+                ChatMessageUser(content=MAIN_TASK),
+                launch,
+                ChatMessageTool(
+                    content="Async agent launched successfully.",
+                    tool_call_id="toolu_1",
+                ),
+            ]
+        ),
+    )
+    assert parent.span_id == "outer"

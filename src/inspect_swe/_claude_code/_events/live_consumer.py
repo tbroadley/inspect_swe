@@ -67,6 +67,7 @@ from inspect_ai.model._chat_message import (
     ChatMessage,
     ChatMessageAssistant,
     ChatMessageSystem,
+    ChatMessageTool,
     ChatMessageUser,
 )
 from inspect_ai.model._model import ModelEventSink
@@ -90,6 +91,28 @@ class _OpenAgent:
     """An agent span currently open (Task tool_use seen, sub-agent not done)."""
 
     span_id: str
+    # tool_use_id of the Task/Agent call that launched the sub-agent
+    origin: str
+    # a resumed run's span is keyed by the SendMessage (or task_started)
+    # tool_use_id; that tool's result never means the sub-agent finished
+    resumed: bool = False
+
+
+@dataclass
+class _Launched:
+    """A sub-agent launched this attempt, kept after it finishes.
+
+    A finished background agent can be resumed (SendMessage), and the resumed
+    run needs a span of its own.
+    """
+
+    prompt: str
+    span_name: str
+    description: str
+    parent_span_id: str | None
+    name: str | None = None
+    agent_id: str | None = None
+    runs: int = 0
 
 
 class LiveConsumer(ModelEventSink):
@@ -115,6 +138,9 @@ class LiveConsumer(ModelEventSink):
         # background agent task_id → tool_use_id, for task_notifications that
         # carry no tool_use_id
         self._task_ids: dict[str, str] = {}
+
+        # launching tool_use_id → _Launched, for every sub-agent this attempt
+        self._launched: dict[str, _Launched] = {}
 
         # Track which event objects we've already _event()'d so on_complete
         # knows whether to emit _event_updated (yes if we emitted) vs swallow
@@ -155,6 +181,7 @@ class LiveConsumer(ModelEventSink):
             transcript()._event(SpanEndEvent(id=agent.span_id))
         self._pending_subagents.clear()
         self._task_ids.clear()
+        self._launched.clear()
         self._emitted_events.clear()
         self._last_stop_reason = None
 
@@ -200,27 +227,72 @@ class LiveConsumer(ModelEventSink):
                 prompt = args.get("prompt")
                 if not isinstance(prompt, str) or not prompt:
                     continue
-                if tc.id in self._open_agents:
+                if tc.id in self._launched:
                     # idempotent — defensive against retries
                     continue
-                agent_span_id = f"agent-{tc.id}"
-                self._open_agents[tc.id] = _OpenAgent(span_id=agent_span_id)
-                self._pending_subagents[tc.id] = prompt
-                span_name = args.get("subagent_type") or args.get("name") or "agent"
-                description = args.get("description") or ""
-                transcript()._event(
-                    SpanBeginEvent(
-                        id=agent_span_id,
-                        parent_id=parent_span_id,
-                        type="agent",
-                        name=str(span_name),
-                        metadata={"description": description} if description else None,
-                    )
+                name = args.get("name")
+                self._launched[tc.id] = _Launched(
+                    prompt=prompt,
+                    span_name=str(args.get("subagent_type") or name or "agent"),
+                    description=str(args.get("description") or ""),
+                    parent_span_id=parent_span_id,
+                    name=name if isinstance(name, str) else None,
                 )
+                self._open_span(tc.id, tc.id)
+
+            # SendMessage to a finished background agent resumes it: reopen
+            # its span now, before the resumed run's first call arrives
+            for tc in msg.tool_calls:
+                if tc.function != "SendMessage":
+                    continue
+                origin = self._find_launched((tc.arguments or {}).get("to"))
+                if origin is not None and not self._is_open(origin):
+                    self._open_span(tc.id, origin, parent_span_id)
 
         if id(event) in self._emitted_events:
             self._emitted_events.discard(id(event))
             transcript()._event_updated(event)
+
+    def _open_span(
+        self, key: str, origin: str, parent_span_id: str | None = None
+    ) -> None:
+        launched = self._launched[origin]
+        resumed = launched.runs > 0
+        launched.runs += 1
+        span_id = f"agent-{origin}-run{launched.runs}" if resumed else f"agent-{origin}"
+        parent_span_id = parent_span_id or launched.parent_span_id
+        self._open_agents[key] = _OpenAgent(
+            span_id=span_id, origin=origin, resumed=key != origin
+        )
+        self._pending_subagents[key] = launched.prompt
+        metadata: dict[str, str] = {}
+        if launched.description:
+            metadata["description"] = launched.description
+        if resumed:
+            metadata["resumes"] = f"agent-{origin}"
+        transcript()._event(
+            SpanBeginEvent(
+                id=span_id,
+                parent_id=parent_span_id,
+                type="agent",
+                name=launched.span_name,
+                metadata=metadata or None,
+            )
+        )
+
+    def _is_open(self, origin: str) -> bool:
+        return any(a.origin == origin for a in self._open_agents.values())
+
+    def _find_launched(self, ref: Any) -> str | None:
+        """Launching tool_use_id of the sub-agent a SendMessage `to` names."""
+        if not isinstance(ref, str) or not ref:
+            return None
+        matches = [
+            origin
+            for origin, launched in self._launched.items()
+            if ref in (launched.agent_id, launched.name)
+        ]
+        return matches[-1] if matches else None
 
     # ------------------------------------------------------------------
     # JSONL consumer
@@ -250,10 +322,21 @@ class LiveConsumer(ModelEventSink):
     def _attribute(self, input_messages: list[ChatMessage]) -> str | None:
         """Resolve the span_id for an incoming bridge call.
 
-        Substring-matches the first user message's text against currently-
-        pending sub-agent prompts. Exactly one match → that sub-agent's
-        span. Zero or multiple matches → outer span.
+        A fork (`subagent_type: "fork"`) inherits its parent's history, so its
+        prompt is not in its first message; it is recognised by the synthetic
+        "Fork started" result Claude Code gives it for its own launching call.
+        Otherwise substring-matches the first user message's text against
+        currently-pending sub-agent prompts. Exactly one match → that
+        sub-agent's span. Zero or multiple matches → outer span.
         """
+        for msg in reversed(input_messages):
+            if (
+                isinstance(msg, ChatMessageTool)
+                and msg.tool_call_id in self._open_agents
+                and msg.text.lstrip().startswith("Fork started")
+            ):
+                return self._open_agents[msg.tool_call_id].span_id
+
         if not self._pending_subagents:
             return self.outer_span_id
 
@@ -319,7 +402,10 @@ class LiveConsumer(ModelEventSink):
         structured = raw.get("tool_use_result") if len(blocks) == 1 else None
         for block in blocks:
             tool_use_id = str(block["tool_use_id"])
-            if tool_use_id in self._open_agents:
+            agent = self._open_agents.get(tool_use_id)
+            if agent is not None:
+                if agent.resumed:
+                    continue
                 task_id = _async_launch_task_id(
                     structured, block, self._pending_subagents.get(tool_use_id)
                 )
@@ -327,6 +413,7 @@ class LiveConsumer(ModelEventSink):
                     # background agent: still running, close on task_notification
                     if task_id:
                         self._task_ids[task_id] = tool_use_id
+                        self._launched[agent.origin].agent_id = task_id
                     continue
             self._close_agent(tool_use_id)
 
@@ -343,14 +430,25 @@ class LiveConsumer(ModelEventSink):
     def _handle_system(self, raw: dict[str, Any]) -> None:
         """Handle compaction boundaries and background-agent completion.
 
-        `task_started` is ignored: registration happens in `on_complete`
-        (synchronous with the parent's bridge call, ahead of any race).
+        Spans open in `on_complete` (synchronous with the parent's bridge
+        call, ahead of any race); `task_started` only reopens a finished
+        agent that resumed without a SendMessage we saw first.
         `task_notification` closes background agents, whose `tool_result`
         arrived at launch; foreground agents close in `_handle_user`.
         """
         subtype = raw.get("subtype")
         if subtype == "compact_boundary":
             self._handle_compact_boundary(raw)
+        elif subtype == "task_started":
+            tool_use_id = raw.get("tool_use_id")
+            origin = self._find_launched(raw.get("task_id"))
+            if (
+                isinstance(tool_use_id, str)
+                and origin is not None
+                and tool_use_id not in self._open_agents
+                and not self._is_open(origin)
+            ):
+                self._open_span(tool_use_id, origin)
         elif subtype == "task_notification":
             tool_use_id = raw.get("tool_use_id")
             task_id = raw.get("task_id")
