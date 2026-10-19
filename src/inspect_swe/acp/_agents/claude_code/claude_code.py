@@ -120,98 +120,101 @@ class ClaudeCode(ACPAgent):
 
         # attributes each ModelEvent to its sub-agent's span, as in the
         # non-ACP agent
-        consumer = LiveConsumer()
-        async with sandbox_agent_bridge(
-            state,
-            model=None,
-            model_aliases=self.model_map,
-            filter=self.filter,
-            retry_refusals=self.retry_refusals,
-            bridged_tools=self.bridged_tools or None,
-            web_search=not web_search_tool_disallowed(
-                self._disallowed_tools, "WebSearch"
-            ),
-            port=port,
-            model_event_sink=consumer,
-        ) as bridge:
-            # Install node and claude-agent-acp in the sandbox.
-            acp_binary, node_binary = await ensure_claude_code_acp_setup(
-                sbox, self.user
-            )
-            node_dir = str(Path(node_binary).parent)
+        consumer = LiveConsumer(close_from_input=True)
+        try:
+            async with sandbox_agent_bridge(
+                state,
+                model=None,
+                model_aliases=self.model_map,
+                filter=self.filter,
+                retry_refusals=self.retry_refusals,
+                bridged_tools=self.bridged_tools or None,
+                web_search=not web_search_tool_disallowed(
+                    self._disallowed_tools, "WebSearch"
+                ),
+                port=port,
+                model_event_sink=consumer,
+            ) as bridge:
+                # Install node and claude-agent-acp in the sandbox.
+                acp_binary, node_binary = await ensure_claude_code_acp_setup(
+                    sbox, self.user
+                )
+                node_dir = str(Path(node_binary).parent)
 
-            # Use canonical model names — the bridge resolves them via
-            # model_aliases to Model instances directly.
-            agent_env = (
-                _BRIDGE_SAFE_ENV
-                | {
-                    "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
-                    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-                    "ANTHROPIC_MODEL": default_model,
-                    "ANTHROPIC_DEFAULT_OPUS_MODEL": get_model(
-                        self._opus_model
-                    ).canonical_name()
-                    if self._opus_model
-                    else default_model,
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL": get_model(
-                        self._sonnet_model
-                    ).canonical_name()
-                    if self._sonnet_model
-                    else default_model,
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": get_model(
-                        self._haiku_model
-                    ).canonical_name()
-                    if self._haiku_model
-                    else default_model,
-                    "CLAUDE_CODE_SUBAGENT_MODEL": get_model(
-                        self._subagent_model
-                    ).canonical_name()
-                    if self._subagent_model
-                    else default_model,
-                    "ANTHROPIC_SMALL_FAST_MODEL": get_model(
-                        self._haiku_model
-                    ).canonical_name()
-                    if self._haiku_model
-                    else default_model,
-                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-                    "IS_SANDBOX": "1",
-                    "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
-                }
-                | self.env
-            )
-
-            # System prompt via env (the ACP adapter will forward to CC)
-            resolved_prompt = self._resolve_system_prompt(state)
-            if resolved_prompt:
-                agent_env["CLAUDE_CODE_APPEND_SYSTEM_PROMPT"] = resolved_prompt
-
-            # Disallowed tools
-            if self._disallowed_tools:
-                agent_env["CLAUDE_CODE_DISALLOWED_TOOLS"] = ",".join(
-                    self._disallowed_tools
+                # Use canonical model names — the bridge resolves them via
+                # model_aliases to Model instances directly.
+                agent_env = (
+                    _BRIDGE_SAFE_ENV
+                    | {
+                        "ANTHROPIC_BASE_URL": f"http://localhost:{bridge.port}",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
+                        "ANTHROPIC_MODEL": default_model,
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": get_model(
+                            self._opus_model
+                        ).canonical_name()
+                        if self._opus_model
+                        else default_model,
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": get_model(
+                            self._sonnet_model
+                        ).canonical_name()
+                        if self._sonnet_model
+                        else default_model,
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": get_model(
+                            self._haiku_model
+                        ).canonical_name()
+                        if self._haiku_model
+                        else default_model,
+                        "CLAUDE_CODE_SUBAGENT_MODEL": get_model(
+                            self._subagent_model
+                        ).canonical_name()
+                        if self._subagent_model
+                        else default_model,
+                        "ANTHROPIC_SMALL_FAST_MODEL": get_model(
+                            self._haiku_model
+                        ).canonical_name()
+                        if self._haiku_model
+                        else default_model,
+                        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                        "IS_SANDBOX": "1",
+                        "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
+                    }
+                    | self.env
                 )
 
-            # Install skills
-            if self._resolved_skills:
-                skills_dir = join_path(self.cwd, ".claude/skills")
-                await install_skills(self._resolved_skills, sbox, self.user, skills_dir)
+                # System prompt via env (the ACP adapter will forward to CC)
+                resolved_prompt = self._resolve_system_prompt(state)
+                if resolved_prompt:
+                    agent_env["CLAUDE_CODE_APPEND_SYSTEM_PROMPT"] = resolved_prompt
 
-            # Start ACP adapter process
-            logger.info("Starting claude-agent-acp adapter...")
-            proc = await sbox.exec_remote(
-                cmd=[acp_binary],
-                options=ExecRemoteStreamingOptions(
-                    stdin_open=True,
-                    cwd=self.cwd,
-                    env=agent_env,
-                    user=self.user,
-                ),
-            )
+                # Disallowed tools
+                if self._disallowed_tools:
+                    agent_env["CLAUDE_CODE_DISALLOWED_TOOLS"] = ",".join(
+                        self._disallowed_tools
+                    )
 
-            try:
+                # Install skills
+                if self._resolved_skills:
+                    skills_dir = join_path(self.cwd, ".claude/skills")
+                    await install_skills(
+                        self._resolved_skills, sbox, self.user, skills_dir
+                    )
+
+                # Start ACP adapter process
+                logger.info("Starting claude-agent-acp adapter...")
+                proc = await sbox.exec_remote(
+                    cmd=[acp_binary],
+                    options=ExecRemoteStreamingOptions(
+                        stdin_open=True,
+                        cwd=self.cwd,
+                        env=agent_env,
+                        user=self.user,
+                    ),
+                )
+
                 yield proc, bridge
-            finally:
-                consumer.reset()
+        finally:
+            # after the bridge exits, so no late request reopens a span
+            consumer.reset()
 
 
 # ---------------------------------------------------------------------------

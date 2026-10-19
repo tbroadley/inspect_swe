@@ -72,7 +72,7 @@ def setup(
     stub = _TranscriptStub()
     monkeypatch.setattr(consumer_module, "transcript", lambda: stub)
     monkeypatch.setattr(consumer_module, "current_span_id", lambda: "outer")
-    return LiveConsumer(), stub
+    return LiveConsumer(close_from_input=True), stub
 
 
 def _call(
@@ -193,4 +193,76 @@ def test_fork_started_result_does_not_close(
         ChatMessageUser(content=f"Your directive: {PROMPT}"),
     ]
     assert _call(consumer, fork_input) == "agent-toolu_1"
+    assert stub.ends() == []
+
+
+def _send(consumer: LiveConsumer, history: list[ChatMessage], send_id: str) -> None:
+    send = [ToolCall(id=send_id, function="SendMessage", arguments={"to": AGENT_ID})]
+    _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH, *history], send)
+
+
+def test_resumed_run_closes_on_its_own_tool_use_id(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    # real shape: the resumed run's notification names the SendMessage id
+    consumer, stub = setup
+    _launch(consumer)
+    ack = ChatMessageTool(content=ACK, tool_call_id="toolu_1")
+    first_done = ChatMessageUser(content=_notification("toolu_1"))
+    history: list[ChatMessage] = [ack, ChatMessageAssistant(content="w"), first_done]
+    _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH, *history])
+    _send(consumer, history, "toolu_send")
+    history += [
+        ChatMessageAssistant(
+            content="",
+            tool_calls=[
+                ToolCall(id="toolu_send", function="SendMessage", arguments={})
+            ],
+        ),
+        ChatMessageTool(content="Resuming agent", tool_call_id="toolu_send"),
+        ChatMessageAssistant(content="waiting again"),
+        ChatMessageUser(content=_notification("toolu_send")),
+    ]
+    _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH, *history])
+    assert stub.ends() == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def test_stale_notification_after_rollover_keeps_new_run(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    ack = ChatMessageTool(content=ACK, tool_call_id="toolu_1")
+    _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH, ack])
+    _send(consumer, [ack], "toolu_send")  # queued: run 1 still open
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="21 lines."),
+        ChatMessageUser(content="The coordinator sent a message: more"),
+    ]
+    assert _call(consumer, resumed) == "agent-toolu_1-run2"
+    # run 1's notification reaches the parent after the rollover
+    late: list[ChatMessage] = [ack, ChatMessageAssistant(content="w")]
+    _call(
+        consumer,
+        [
+            ChatMessageUser(content=MAIN),
+            LAUNCH,
+            *late,
+            ChatMessageUser(content=_notification("toolu_1")),
+        ],
+    )
+    assert stub.ends() == ["agent-toolu_1"]
+    assert _call(consumer, resumed) == "agent-toolu_1-run2"
+
+
+def test_cli_consumer_does_not_close_from_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _TranscriptStub()
+    monkeypatch.setattr(consumer_module, "transcript", lambda: stub)
+    monkeypatch.setattr(consumer_module, "current_span_id", lambda: "outer")
+    consumer = LiveConsumer()
+    _launch(consumer)
+    _parent(consumer, ChatMessageTool(content="21 lines.", tool_call_id="toolu_1"))
     assert stub.ends() == []

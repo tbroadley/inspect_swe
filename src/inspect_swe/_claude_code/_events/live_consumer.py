@@ -153,7 +153,16 @@ class LiveConsumer(ModelEventSink):
     by Claude Code.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, close_from_input: bool = False) -> None:
+        # Close sub-agent spans from what the parent sees in its requests.
+        # Only for agents with no stream-json output (ACP): with JSONL, the
+        # structured results and run ids there are more reliable.
+        self._close_from_input_enabled = close_from_input
+
+        # every key a span was ever opened under; a notification naming a
+        # closed one is stale and must not fall back to the task id
+        self._seen_keys: set[str] = set()
+
         # tool_use_id → _OpenAgent for currently-open agent spans (Task/Agent
         # tool_use blocks we've SpanBegin'd, not yet SpanEnd'd).
         self._open_agents: dict[str, _OpenAgent] = {}
@@ -219,7 +228,8 @@ class LiveConsumer(ModelEventSink):
     # ------------------------------------------------------------------
 
     def on_pending(self, event: ModelEvent) -> None:
-        self._close_from_input(event.input)
+        if self._close_from_input_enabled:
+            self._close_from_input(event.input)
         event.span_id = self._attribute(event.input)
         self._emitted_events.add(id(event))
         transcript()._event(event)
@@ -315,6 +325,7 @@ class LiveConsumer(ModelEventSink):
             stale_run_ids=stale_run_ids or set(),
         )
         self._open_agents[key] = agent
+        self._seen_keys.add(key)
         launched.span_id = span_id
         self._pending_subagents[key] = launched.prompt
         if resumed and launched.agent_id:
@@ -370,7 +381,8 @@ class LiveConsumer(ModelEventSink):
                     continue
                 text = msg.text.lstrip()
                 if agent.via_send_message:
-                    if "Resuming agent" in text or '"success":true' in text:
+                    block = {"content": msg.text, "is_error": msg.error is not None}
+                    if _send_message_succeeded(None, block):
                         continue
                 elif text.startswith("Fork started"):
                     continue
@@ -383,6 +395,8 @@ class LiveConsumer(ModelEventSink):
             elif isinstance(msg, ChatMessageUser):
                 for note in _TASK_NOTIFICATION.findall(msg.text):
                     key = _xml_field(note, "tool-use-id")
+                    if key in self._seen_keys and key not in self._open_agents:
+                        continue  # a run we already closed or rolled past
                     if key not in self._open_agents:
                         key = self._task_ids.get(_xml_field(note, "task-id") or "")
                     if key is not None:

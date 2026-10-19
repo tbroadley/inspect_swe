@@ -90,107 +90,112 @@ class CodexCli(ACPAgent):
         # attributes each ModelEvent to its sub-agent's span, as in the
         # non-ACP agent
         consumer = CodexConsumer()
-        async with sandbox_agent_bridge(
-            state,
-            model=None,
-            model_aliases=resolve_codex_auto_review_model_aliases(
-                self._auto_review,
-                self.model_map,
-                # the ACP bridge has no fallback model (model=None), so the
-                # guardian slug must be bound explicitly; default guardian
-                # requests to this agent's model
-                default=get_model(self.model),
-            ),
-            filter=self.filter,
-            retry_refusals=self.retry_refusals,
-            bridged_tools=self.bridged_tools or None,
-            web_search=self._web_search != "disabled",
-            port=port,
-            model_event_sink=consumer,
-        ) as bridge:
-            # Install node and codex-acp in the sandbox.
-            acp_binary, node_binary = await ensure_codex_acp_setup(sbox, self.user)
-            node_dir = str(Path(node_binary).parent)
-
-            # Resolve CODEX_HOME (mirrors the non-ACP codex_cli agent).
-            if self._home_dir is None:
-                working_dir = await sandbox_exec(
-                    sbox, "pwd", user=self.user, cwd=self.cwd
-                )
-                codex_home = join_path(working_dir, ".codex")
-            else:
-                codex_home = await sandbox_exec(
-                    sbox,
-                    f'eval echo "{self._home_dir}"',
-                    user=self.user,
-                    cwd=self.cwd,
-                )
-            await sandbox_exec(sbox, cmd=f"mkdir -p {codex_home}", user=self.user)
-
-            # Write system prompt to AGENTS.md (Codex convention).
-            resolved_prompt = self._resolve_system_prompt(state)
-            if resolved_prompt:
-                agents_md_path = self._agents_md_path(codex_home)
-                await sbox.write_file(agents_md_path, resolved_prompt)
-
-            # Install skills.
-            if self._resolved_skills:
-                skills_dir = join_path(codex_home, "skills")
-                await install_skills(self._resolved_skills, sbox, self.user, skills_dir)
-
-            # Write config.toml with model provider pointing at the bridge.
-            # Use the canonical model name so the bridge can resolve it
-            # via model_aliases (consistent with how claude-agent-acp passes
-            # ANTHROPIC_MODEL).
-            bridge_url = f"http://127.0.0.1:{bridge.port}/v1"
-            config_toml_path = await self._config_toml_path(sbox, codex_home)
-            toml_config: dict[str, Any] = {
-                "model": default_model,
-                "preferred_auth_method": "apikey",
-                # overridden below by codex_config_options() when auto_review is enabled
-                "approval_policy": "never",
-                "sandbox_mode": "danger-full-access",
-                "model_provider": "openai-proxy",
-                "model_providers.openai-proxy": {
-                    "name": "OpenAI Proxy",
-                    "base_url": bridge_url,
-                    "env_key": "OPENAI_API_KEY",
-                    "wire_api": "responses",
-                    "stream_idle_timeout_ms": 3_600_000,
-                },
-            }
-            toml_config.update(self._config_overrides)
-            toml_config.update(
-                codex_config_options(self._web_search, self._goals, self._auto_review)
-            )
-            await sbox.write_file(config_toml_path, to_toml(toml_config))
-
-            # Environment variables (same as the non-ACP codex agent).
-            agent_env = {
-                "CODEX_HOME": codex_home,
-                "OPENAI_API_KEY": "api-key",
-                "OPENAI_BASE_URL": bridge_url,
-                "RUST_LOG": "warning",
-                "NO_BROWSER": "1",
-                "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
-            } | self.env
-
-            # Start ACP adapter process.
-            logger.info("Starting codex-acp adapter...")
-            proc = await sbox.exec_remote(
-                cmd=[acp_binary],
-                options=ExecRemoteStreamingOptions(
-                    stdin_open=True,
-                    cwd=self.cwd,
-                    env=agent_env,
-                    user=self.user,
+        try:
+            async with sandbox_agent_bridge(
+                state,
+                model=None,
+                model_aliases=resolve_codex_auto_review_model_aliases(
+                    self._auto_review,
+                    self.model_map,
+                    # the ACP bridge has no fallback model (model=None), so the
+                    # guardian slug must be bound explicitly; default guardian
+                    # requests to this agent's model
+                    default=get_model(self.model),
                 ),
-            )
+                filter=self.filter,
+                retry_refusals=self.retry_refusals,
+                bridged_tools=self.bridged_tools or None,
+                web_search=self._web_search != "disabled",
+                port=port,
+                model_event_sink=consumer,
+            ) as bridge:
+                # Install node and codex-acp in the sandbox.
+                acp_binary, node_binary = await ensure_codex_acp_setup(sbox, self.user)
+                node_dir = str(Path(node_binary).parent)
 
-            try:
+                # Resolve CODEX_HOME (mirrors the non-ACP codex_cli agent).
+                if self._home_dir is None:
+                    working_dir = await sandbox_exec(
+                        sbox, "pwd", user=self.user, cwd=self.cwd
+                    )
+                    codex_home = join_path(working_dir, ".codex")
+                else:
+                    codex_home = await sandbox_exec(
+                        sbox,
+                        f'eval echo "{self._home_dir}"',
+                        user=self.user,
+                        cwd=self.cwd,
+                    )
+                await sandbox_exec(sbox, cmd=f"mkdir -p {codex_home}", user=self.user)
+
+                # Write system prompt to AGENTS.md (Codex convention).
+                resolved_prompt = self._resolve_system_prompt(state)
+                if resolved_prompt:
+                    agents_md_path = self._agents_md_path(codex_home)
+                    await sbox.write_file(agents_md_path, resolved_prompt)
+
+                # Install skills.
+                if self._resolved_skills:
+                    skills_dir = join_path(codex_home, "skills")
+                    await install_skills(
+                        self._resolved_skills, sbox, self.user, skills_dir
+                    )
+
+                # Write config.toml with model provider pointing at the bridge.
+                # Use the canonical model name so the bridge can resolve it
+                # via model_aliases (consistent with how claude-agent-acp passes
+                # ANTHROPIC_MODEL).
+                bridge_url = f"http://127.0.0.1:{bridge.port}/v1"
+                config_toml_path = await self._config_toml_path(sbox, codex_home)
+                toml_config: dict[str, Any] = {
+                    "model": default_model,
+                    "preferred_auth_method": "apikey",
+                    # overridden below by codex_config_options() when auto_review is enabled
+                    "approval_policy": "never",
+                    "sandbox_mode": "danger-full-access",
+                    "model_provider": "openai-proxy",
+                    "model_providers.openai-proxy": {
+                        "name": "OpenAI Proxy",
+                        "base_url": bridge_url,
+                        "env_key": "OPENAI_API_KEY",
+                        "wire_api": "responses",
+                        "stream_idle_timeout_ms": 3_600_000,
+                    },
+                }
+                toml_config.update(self._config_overrides)
+                toml_config.update(
+                    codex_config_options(
+                        self._web_search, self._goals, self._auto_review
+                    )
+                )
+                await sbox.write_file(config_toml_path, to_toml(toml_config))
+
+                # Environment variables (same as the non-ACP codex agent).
+                agent_env = {
+                    "CODEX_HOME": codex_home,
+                    "OPENAI_API_KEY": "api-key",
+                    "OPENAI_BASE_URL": bridge_url,
+                    "RUST_LOG": "warning",
+                    "NO_BROWSER": "1",
+                    "PATH": f"{node_dir}:/usr/local/bin:/usr/bin:/bin",
+                } | self.env
+
+                # Start ACP adapter process.
+                logger.info("Starting codex-acp adapter...")
+                proc = await sbox.exec_remote(
+                    cmd=[acp_binary],
+                    options=ExecRemoteStreamingOptions(
+                        stdin_open=True,
+                        cwd=self.cwd,
+                        env=agent_env,
+                        user=self.user,
+                    ),
+                )
+
                 yield proc, bridge
-            finally:
-                consumer.reset()
+        finally:
+            # after the bridge exits, so no late request reopens a span
+            consumer.reset()
 
     def _agents_md_path(self, codex_home: str) -> str:
         """Determine where to write AGENTS.md."""
