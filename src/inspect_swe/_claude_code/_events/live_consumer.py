@@ -42,7 +42,11 @@ Two responsibilities, both driven from the same `LiveConsumer` instance:
    Claude Code re-sends the sub-agent's full conversation history on
    each request, with the original Task prompt always at `input[0]`.
    `_pending_subagents` and the open span are cleared in `_handle_user`
-   when the matching `tool_result` arrives.
+   when the matching `tool_result` arrives — except for background agents
+   (`run_in_background`, the default in recent Claude Code), whose
+   `tool_result` is an immediate `async_launched` acknowledgement while the
+   sub-agent keeps running. Those stay open until the `task_notification`
+   system event for the same `tool_use_id` (or `reset()`).
 
 2. **JSONL consumer** — `process_jsonl_line` reads each line printed by
    Claude Code's `--output-format stream-json` and emits agent
@@ -293,24 +297,33 @@ class LiveConsumer(ModelEventSink):
             tool_use_id = block.get("tool_use_id")
             if not tool_use_id:
                 continue
-            # Clear pending-subagent entry (no-op for non-Task tool_results).
-            self._pending_subagents.pop(tool_use_id, None)
-            agent = self._open_agents.pop(tool_use_id, None)
-            if agent is None:
+            if tool_use_id in self._open_agents and _is_async_launch(raw, block):
+                # background agent: still running, close on task_notification
                 continue
+            self._close_agent(tool_use_id)
+
+    def _close_agent(self, tool_use_id: str) -> None:
+        # Clear pending-subagent entry (no-op for non-Task tool_results).
+        self._pending_subagents.pop(tool_use_id, None)
+        agent = self._open_agents.pop(tool_use_id, None)
+        if agent is not None:
             transcript()._event(SpanEndEvent(id=agent.span_id))
 
     def _handle_system(self, raw: dict[str, Any]) -> None:
         """Handle system events (only compaction boundaries today).
 
-        Sub-agent lifecycle (`task_started`/`task_notification`) intentionally
-        ignored: registration happens in `on_complete` (synchronous with the
-        parent's bridge call, ahead of any race), and cleanup happens in
-        `_handle_user` on the matching tool_result.
+        `task_started` is ignored: registration happens in `on_complete`
+        (synchronous with the parent's bridge call, ahead of any race).
+        `task_notification` closes background agents, whose `tool_result`
+        arrived at launch; foreground agents close in `_handle_user`.
         """
         subtype = raw.get("subtype")
         if subtype == "compact_boundary":
             self._handle_compact_boundary(raw)
+        elif subtype == "task_notification":
+            tool_use_id = raw.get("tool_use_id")
+            if isinstance(tool_use_id, str):
+                self._close_agent(tool_use_id)
 
     def _handle_compact_boundary(self, raw: dict[str, Any]) -> None:
         parent_tool_use_id = raw.get("parent_tool_use_id")
@@ -332,3 +345,20 @@ class LiveConsumer(ModelEventSink):
                 },
             )
         )
+
+
+def _is_async_launch(raw: dict[str, Any], block: dict[str, Any]) -> bool:
+    """Whether a Task/Agent tool_result acknowledges a background launch.
+
+    Prefers the structured `tool_use_result` Claude Code attaches to the
+    JSONL `user` line; falls back to the result text.
+    """
+    result = raw.get("tool_use_result")
+    if isinstance(result, dict) and "status" in result:
+        return result["status"] in ("async_launched", "remote_launched")
+    content = block.get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            str(c.get("text", "")) for c in content if isinstance(c, dict)
+        )
+    return isinstance(content, str) and "Async agent launched" in content
