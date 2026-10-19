@@ -320,7 +320,11 @@ def test_parent_quoting_prompt_stays_on_outer_span(
     main_task = f"Please do this. {PROMPT} Then fix them."
     _launch(consumer, main_task=main_task)
     consumer.process_jsonl_line(ASYNC_ACK)
-    parent = _call(consumer, _model_event([ChatMessageUser(content=main_task)]))
+    launch = ChatMessageAssistant(
+        content="",
+        tool_calls=[ToolCall(id="toolu_1", function="Agent", arguments={})],
+    )
+    parent = _call(consumer, _model_event([ChatMessageUser(content=main_task), launch]))
     assert parent.span_id == "outer"
     assert _subagent_call(consumer).span_id == "agent-toolu_1"
 
@@ -343,3 +347,11 @@ def test_foreground_report_mentioning_launch_closes(
         _tool_result_line("Done. Async agent launched for the docs earlier.", None)
     )
     assert _ends(stub) == ["agent-toolu_1"]
+
+
+def test_verbatim_delegation_attributes_to_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer, main_task=PROMPT)
+    assert _subagent_call(consumer).span_id == "agent-toolu_1"

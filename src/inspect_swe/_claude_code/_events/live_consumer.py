@@ -65,6 +65,7 @@ from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
 from inspect_ai.model._chat_message import (
     ChatMessage,
+    ChatMessageAssistant,
     ChatMessageSystem,
     ChatMessageUser,
 )
@@ -89,10 +90,6 @@ class _OpenAgent:
     """An agent span currently open (Task tool_use seen, sub-agent not done)."""
 
     span_id: str
-    # first user text of the call that launched the sub-agent: a parent that
-    # keeps working beside a background sub-agent re-sends it, and must not
-    # match the sub-agent's prompt when that prompt is quoted from it
-    parent_text: str | None = None
 
 
 class LiveConsumer(ModelEventSink):
@@ -207,10 +204,7 @@ class LiveConsumer(ModelEventSink):
                     # idempotent — defensive against retries
                     continue
                 agent_span_id = f"agent-{tc.id}"
-                self._open_agents[tc.id] = _OpenAgent(
-                    span_id=agent_span_id,
-                    parent_text=self._first_user_text(event.input),
-                )
+                self._open_agents[tc.id] = _OpenAgent(span_id=agent_span_id)
                 self._pending_subagents[tc.id] = prompt
                 span_name = args.get("subagent_type") or args.get("name") or "agent"
                 description = args.get("description") or ""
@@ -267,15 +261,22 @@ class LiveConsumer(ModelEventSink):
         if not user_text:
             return self.outer_span_id
 
+        # a parent working beside a background sub-agent may quote its prompt;
+        # only the parent's history holds the launching tool call
+        launched_here = {
+            tc.id
+            for msg in input_messages
+            if isinstance(msg, ChatMessageAssistant)
+            for tc in msg.tool_calls or []
+        }
         matches: list[str] = []
         for tool_use_id, prompt in self._pending_subagents.items():
             if len(prompt) < _MIN_PROMPT_LENGTH:
                 continue
             if prompt not in user_text:
                 continue
-            agent = self._open_agents.get(tool_use_id)
-            if agent is not None and agent.parent_text == user_text:
-                continue  # the launching parent itself, still running
+            if tool_use_id in launched_here:
+                continue
             matches.append(tool_use_id)
 
         if len(matches) == 1:
@@ -332,9 +333,11 @@ class LiveConsumer(ModelEventSink):
     def _close_agent(self, tool_use_id: str) -> None:
         # Clear pending-subagent entry (no-op for non-Task tool_results).
         self._pending_subagents.pop(tool_use_id, None)
-        self._task_ids = {k: v for k, v in self._task_ids.items() if v != tool_use_id}
         agent = self._open_agents.pop(tool_use_id, None)
         if agent is not None:
+            self._task_ids = {
+                k: v for k, v in self._task_ids.items() if v != tool_use_id
+            }
             transcript()._event(SpanEndEvent(id=agent.span_id))
 
     def _handle_system(self, raw: dict[str, Any]) -> None:
@@ -350,8 +353,9 @@ class LiveConsumer(ModelEventSink):
             self._handle_compact_boundary(raw)
         elif subtype == "task_notification":
             tool_use_id = raw.get("tool_use_id")
-            if not isinstance(tool_use_id, str):
-                tool_use_id = self._task_ids.get(str(raw.get("task_id")))
+            task_id = raw.get("task_id")
+            if not isinstance(tool_use_id, str) and isinstance(task_id, str):
+                tool_use_id = self._task_ids.get(task_id)
             if tool_use_id is not None:
                 self._close_agent(tool_use_id)
 
