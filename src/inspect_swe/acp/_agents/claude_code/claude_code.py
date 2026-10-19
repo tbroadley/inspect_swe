@@ -12,6 +12,7 @@ from inspect_ai.util import ExecRemoteProcess, ExecRemoteStreamingOptions, store
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
+from inspect_swe._claude_code._events.live_consumer import LiveConsumer
 from inspect_swe._claude_code.env import DISABLE_AUTO_MEMORY_ENV
 from inspect_swe._util.path import join_path
 from inspect_swe._util.websearch import web_search_tool_disallowed
@@ -117,6 +118,9 @@ class ClaudeCode(ACPAgent):
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        # attributes each ModelEvent to its sub-agent's span, as in the
+        # non-ACP agent
+        consumer = LiveConsumer()
         async with sandbox_agent_bridge(
             state,
             model=None,
@@ -128,6 +132,7 @@ class ClaudeCode(ACPAgent):
                 self._disallowed_tools, "WebSearch"
             ),
             port=port,
+            model_event_sink=consumer,
         ) as bridge:
             # Install node and claude-agent-acp in the sandbox.
             acp_binary, node_binary = await ensure_claude_code_acp_setup(
@@ -203,7 +208,10 @@ class ClaudeCode(ACPAgent):
                 ),
             )
 
-            yield proc, bridge
+            try:
+                yield proc, bridge
+            finally:
+                consumer.reset()
 
 
 # ---------------------------------------------------------------------------

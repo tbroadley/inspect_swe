@@ -18,6 +18,7 @@ from inspect_ai.util import (
 from inspect_ai.util import sandbox as sandbox_env
 from typing_extensions import Unpack
 
+from inspect_swe._codex_cli._events.consumer import CodexConsumer
 from inspect_swe._codex_cli.config import (
     CodexAutoReview,
     CodexDeprecatedArgs,
@@ -86,6 +87,9 @@ class CodexCli(ACPAgent):
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        # attributes each ModelEvent to its sub-agent's span, as in the
+        # non-ACP agent
+        consumer = CodexConsumer()
         async with sandbox_agent_bridge(
             state,
             model=None,
@@ -102,6 +106,7 @@ class CodexCli(ACPAgent):
             bridged_tools=self.bridged_tools or None,
             web_search=self._web_search != "disabled",
             port=port,
+            model_event_sink=consumer,
         ) as bridge:
             # Install node and codex-acp in the sandbox.
             acp_binary, node_binary = await ensure_codex_acp_setup(sbox, self.user)
@@ -182,7 +187,10 @@ class CodexCli(ACPAgent):
                 ),
             )
 
-            yield proc, bridge
+            try:
+                yield proc, bridge
+            finally:
+                consumer.reset()
 
     def _agents_md_path(self, codex_home: str) -> str:
         """Determine where to write AGENTS.md."""

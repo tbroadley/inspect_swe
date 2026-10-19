@@ -219,6 +219,7 @@ class LiveConsumer(ModelEventSink):
     # ------------------------------------------------------------------
 
     def on_pending(self, event: ModelEvent) -> None:
+        self._close_from_input(event.input)
         event.span_id = self._attribute(event.input)
         self._emitted_events.add(id(event))
         transcript()._event(event)
@@ -334,6 +335,58 @@ class LiveConsumer(ModelEventSink):
             )
         )
         return agent
+
+    def _close_from_input(self, input_messages: list[ChatMessage]) -> None:
+        """Close sub-agents whose completion the calling agent is now seeing.
+
+        The bridge-side counterpart of the JSONL handlers, and the only one
+        when there is no stream-json output (ACP). Only messages after the
+        caller's last assistant turn are new; earlier ones were handled when
+        they first arrived (and a resumed agent's old notification must not
+        close its new run). A foreground agent finishes with its Task/Agent
+        tool result; a background one with a `<task-notification>`.
+        """
+        # agent ids from Task/Agent results anywhere in history (SendMessage
+        # names the agent by id, possibly after its span closed)
+        for msg in input_messages:
+            if isinstance(msg, ChatMessageTool) and msg.tool_call_id in self._launched:
+                m = _AGENT_ID_LINE.search(msg.text)
+                if m:
+                    self._bind_agent_id(str(msg.tool_call_id), m.group(1))
+
+        last_assistant = max(
+            (
+                i
+                for i, m in enumerate(input_messages)
+                if isinstance(m, ChatMessageAssistant)
+            ),
+            default=-1,
+        )
+        for msg in input_messages[last_assistant + 1 :]:
+            if isinstance(msg, ChatMessageTool):
+                tool_use_id = str(msg.tool_call_id)
+                agent = self._open_agents.get(tool_use_id)
+                if agent is None:
+                    continue
+                text = msg.text.lstrip()
+                if agent.via_send_message:
+                    if "Resuming agent" in text or '"success":true' in text:
+                        continue
+                elif text.startswith("Fork started"):
+                    continue
+                elif text.startswith("Async agent launched"):
+                    agent_id = self._launched[agent.origin].agent_id
+                    if agent_id:
+                        self._task_ids[agent_id] = tool_use_id
+                    continue
+                self._close_agent(tool_use_id)
+            elif isinstance(msg, ChatMessageUser):
+                for note in _TASK_NOTIFICATION.findall(msg.text):
+                    key = _xml_field(note, "tool-use-id")
+                    if key not in self._open_agents:
+                        key = self._task_ids.get(_xml_field(note, "task-id") or "")
+                    if key is not None:
+                        self._close_agent(key)
 
     def _is_open(self, origin: str) -> bool:
         return self._open_key(origin) is not None
@@ -798,3 +851,11 @@ def _send_message_succeeded(structured: Any, block: dict[str, Any]) -> bool:
         )
     text = _block_text(block)
     return '"success":true' in text.replace(" ", "") or "Resuming agent" in text
+
+
+_TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+
+
+def _xml_field(text: str, tag: str) -> str | None:
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.S)
+    return m.group(1).strip() if m else None
