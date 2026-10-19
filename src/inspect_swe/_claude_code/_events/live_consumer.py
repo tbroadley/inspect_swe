@@ -140,6 +140,9 @@ class _Launched:
     pending_send: str | None = None
     # span of the latest run, for calls that arrive after it closed
     span_id: str | None = None
+    # launching tool_use_id of the sub-agent that launched this one (None:
+    # the main agent); SendMessage names are scoped to the sender's children
+    launcher: str | None = None
 
 
 class LiveConsumer(ModelEventSink):
@@ -264,6 +267,7 @@ class LiveConsumer(ModelEventSink):
                     parent_span_id=parent_span_id,
                     name=name if isinstance(name, str) else None,
                     fork=args.get("subagent_type") == "fork",
+                    launcher=self._origin_of(parent_span_id),
                 )
                 self._open_span(tc.id, tc.id)
 
@@ -341,6 +345,21 @@ class LiveConsumer(ModelEventSink):
                 return key
         return None
 
+    def _origin_of(self, span_id: str | None) -> str | None:
+        """The sub-agent a span belongs to (None: the main agent)."""
+        for origin, launched in self._launched.items():
+            if (
+                span_id is not None
+                and span_id
+                in (
+                    f"agent-{origin}",
+                    launched.span_id,
+                )
+                or (span_id or "").startswith(f"agent-{origin}-run")
+            ):
+                return origin
+        return None
+
     def _find_launched(self, ref: Any, caller_span_id: str | None = None) -> str | None:
         """Launching tool_use_id of the sub-agent a SendMessage `to` names.
 
@@ -353,7 +372,8 @@ class LiveConsumer(ModelEventSink):
         if by_id:
             return by_id[-1]
         by_name = [o for o, la in self._launched.items() if la.name == ref]
-        own = [o for o in by_name if self._launched[o].parent_span_id == caller_span_id]
+        caller = self._origin_of(caller_span_id)
+        own = [o for o in by_name if self._launched[o].launcher == caller]
         matches = own or by_name
         return matches[-1] if matches else None
 
@@ -424,7 +444,7 @@ class LiveConsumer(ModelEventSink):
             if isinstance(msg, ChatMessageAssistant)
             for tc in msg.tool_calls or []
         }
-        # finished agents stay candidates: a resumed run, or a late call
+        boundaries = _run_boundaries(input_messages)
         matches = [
             origin
             for origin, launched in self._launched.items()
@@ -432,10 +452,41 @@ class LiveConsumer(ModelEventSink):
             and len(launched.prompt) >= _MIN_PROMPT_LENGTH
             and launched.prompt in user_text
             and origin not in launched_here
+            # a finished agent only matches a call that shows a resume
+            and (self._is_open(origin) or boundaries >= 1)
         ]
-        if len(matches) == 1:
-            return self._run_span(matches[0], input_messages)
-        return self.outer_span_id
+        best = self._best_match(matches, boundaries)
+        if best is None:
+            return self.outer_span_id
+        return self._run_span(best, input_messages)
+
+    def _best_match(self, matches: list[str], boundaries: int) -> str | None:
+        """Rank prompt matches (several when prompts repeat or nest).
+
+        The longest prompt wins over prompts it contains; then an open agent
+        whose current run fits the call; then a finished agent the call
+        resumes; then the most recent launch.
+        """
+        prompts = {o: self._launched[o].prompt for o in matches}
+        matches = [
+            o
+            for o in matches
+            if not any(prompts[o] != p and prompts[o] in p for p in prompts.values())
+        ]
+        if len(matches) <= 1:
+            return matches[0] if matches else None
+
+        def rank(origin: str) -> tuple[int, int]:
+            runs = self._launched[origin].runs
+            if self._is_open(origin) and boundaries == runs - 1:
+                tier = 2
+            elif boundaries >= runs:
+                tier = 1
+            else:
+                tier = 0
+            return (tier, list(self._launched).index(origin))
+
+        return max(matches, key=rank)
 
     def _run_span(self, origin: str, history: list[ChatMessage]) -> str | None:
         """Span for a call from a launched sub-agent.
@@ -577,8 +628,13 @@ class LiveConsumer(ModelEventSink):
             open_key = self._open_key(origin)
             if open_key is None:
                 self._open_span(tool_use_id, origin, run_id=run_id)
-            elif self._open_agents[open_key].run_id is None:
-                self._open_agents[open_key].run_id = run_id
+                return
+            current = self._open_agents[open_key]
+            if current.run_id is None:
+                current.run_id = run_id
+            elif run_id is not None and run_id != current.run_id:
+                # a new run we have not seen from the bridge yet
+                self._roll_over(open_key).run_id = run_id
         elif subtype == "task_notification":
             if not isinstance(tool_use_id, str) or tool_use_id not in self._open_agents:
                 tool_use_id = (
@@ -647,7 +703,10 @@ def _run_boundaries(history: list[ChatMessage]) -> int:
     """Finished runs visible in a sub-agent's history.
 
     A run ends with a text-only assistant turn; a resumed run continues the
-    same history with a new user turn after it.
+    same history with a new user turn after it. Claude Code can also add a
+    user turn inside one run (max-output-tokens recovery, a blocking
+    SubagentStop hook); that splits the run's span in two, and the second
+    stays open until `reset()`.
     """
     return sum(
         1

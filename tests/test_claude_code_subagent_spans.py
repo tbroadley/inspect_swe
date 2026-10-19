@@ -179,9 +179,7 @@ def test_foreground_subagent_span_closes_on_tool_result(
         _tool_result_line("Found 3 TODOs", {"status": "completed", "prompt": PROMPT})
     )
     assert [e.id for e in stub.span_ends()] == [begin.id]
-    assert (
-        _subagent_call(consumer).span_id == begin.id
-    )  # a late call stays with its run
+    assert _subagent_call(consumer).span_id == "outer"
 
 
 def test_background_subagent_stays_in_own_span_after_launch_ack(
@@ -202,7 +200,7 @@ def test_background_subagent_stays_in_own_span_after_launch_ack(
 
     consumer.process_jsonl_line(TASK_NOTIFICATION)
     assert [e.id for e in stub.span_ends()] == [begin.id]
-    assert _subagent_call(consumer).span_id == begin.id
+    assert _subagent_call(consumer).span_id == "outer"
 
 
 def test_background_ack_detected_from_text_without_structured_result(
@@ -255,7 +253,7 @@ def test_notification_before_ack(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer.process_jsonl_line(TASK_NOTIFICATION)
     consumer.process_jsonl_line(ASYNC_ACK)
     assert _ends(stub) == ["agent-toolu_1"]
-    assert _subagent_call(consumer).span_id == "agent-toolu_1"
+    assert _subagent_call(consumer).span_id == "outer"
 
 
 def test_unknown_notification_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -288,7 +286,7 @@ def test_concurrent_background_agents(monkeypatch: pytest.MonkeyPatch) -> None:
     consumer.process_jsonl_line(_notification("toolu_2", "d4e5f6"))
     assert _ends(stub) == ["agent-toolu_2"]
     assert _subagent_call(consumer, PROMPT).span_id == "agent-toolu_1"
-    assert _subagent_call(consumer, PROMPT_2).span_id == "agent-toolu_2"
+    assert _subagent_call(consumer, PROMPT_2).span_id == "outer"
 
 
 def test_remote_launched_closes_at_launch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -795,5 +793,95 @@ def test_queued_message_resume_after_close(monkeypatch: pytest.MonkeyPatch) -> N
     assert _call(consumer, _model_event(resumed)).span_id == "agent-toolu_1-run2"
     consumer.process_jsonl_line(_started("aid", "toolu_1", "r2"))
     assert len(stub.span_begins()) == 2
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r2"})
+    assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+def _launch_one(
+    consumer: LiveConsumer, tool_use_id: str, prompt: str, name: str | None = None
+) -> None:
+    args: dict[str, Any] = {"prompt": prompt, "subagent_type": "Explore"}
+    if name:
+        args["name"] = name
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=MAIN_TASK)],
+            [ToolCall(id=tool_use_id, function="Agent", arguments=args)],
+        ),
+    )
+
+
+def test_relaunch_with_same_prompt_goes_to_new_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, _ = _consumer(monkeypatch)
+    _launch_one(consumer, "t1", PROMPT)
+    consumer.process_jsonl_line(_async_ack("t1", agent_id="a1"))
+    consumer.process_jsonl_line(_notification("t1", "a1"))
+    _launch_one(consumer, "t2", PROMPT)
+    assert _subagent_call(consumer).span_id == "agent-t2"
+
+
+def test_longer_prompt_wins_over_the_prompt_it_contains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, _ = _consumer(monkeypatch)
+    short = "Run the test suite and report."
+    _launch_one(consumer, "t1", short)
+    _launch_one(consumer, "t2", short + " Then fix the first failure.")
+    longer = _subagent_call(consumer, short + " Then fix the first failure.")
+    assert longer.span_id == "agent-t2"
+    assert _subagent_call(consumer, short).span_id == "agent-t1"
+
+
+def test_finished_agent_not_matched_without_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # e.g. the main agent after compaction, its summary quoting a prompt
+    consumer, stub = _consumer(monkeypatch)
+    _launch_one(consumer, "t1", PROMPT)
+    consumer.process_jsonl_line(_tool_result_line("done", None, "t1"))
+    assert _subagent_call(consumer).span_id == "outer"
+    assert len(stub.span_begins()) == 1
+
+
+def test_name_scoped_to_launching_agent_across_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch_one(consumer, "t1", PROMPT, name="w")
+    # sub-agent t1 launches its own "w" from its span
+    _call(
+        consumer,
+        _model_event(
+            [ChatMessageUser(content=PROMPT)],
+            [
+                ToolCall(
+                    id="t2",
+                    function="Agent",
+                    arguments={"prompt": PROMPT_2, "name": "w"},
+                )
+            ],
+        ),
+    )
+    assert stub.span_begins()[-1].parent_id == "agent-t1"
+    consumer.process_jsonl_line(_tool_result_line("done", None, "t2"))
+    consumer.process_jsonl_line(_tool_result_line("done", None, "t1"))
+    # main agent's checkpoint span rotated since t1 was launched
+    monkeypatch.setattr(consumer_module, "current_span_id", lambda: "outer-2")
+    _send(consumer, "s1", "w")
+    assert stub.span_begins()[-1].id == "agent-t1-run2"
+
+
+def test_task_started_for_new_run_rolls_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r1"))
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r2"))
+    assert _ends(stub) == ["agent-toolu_1"]
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r1"})
+    assert _ends(stub) == ["agent-toolu_1"]
     consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r2"})
     assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
