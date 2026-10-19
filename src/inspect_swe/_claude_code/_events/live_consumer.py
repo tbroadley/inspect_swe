@@ -50,7 +50,8 @@ Two responsibilities, both driven from the same `LiveConsumer` instance:
 
 2. **JSONL consumer** — `process_jsonl_line` reads each line printed by
    Claude Code's `--output-format stream-json` and emits agent
-   `SpanEndEvent` (on `tool_result` for Task/Agent), and emits
+   `SpanEndEvent` (on `tool_result` for foreground Task/Agent, on
+   `task_notification` for background ones), and emits
    `CompactionEvent` for `compact_boundary` system events. Span
    *opening* is no longer driven from JSONL — see callback (1) above.
 """
@@ -85,9 +86,13 @@ _MIN_PROMPT_LENGTH = 16
 
 @dataclass
 class _OpenAgent:
-    """An agent span currently open (Task tool_use seen, no tool_result yet)."""
+    """An agent span currently open (Task tool_use seen, sub-agent not done)."""
 
     span_id: str
+    # first user text of the call that launched the sub-agent: a parent that
+    # keeps working beside a background sub-agent re-sends it, and must not
+    # match the sub-agent's prompt when that prompt is quoted from it
+    parent_text: str | None = None
 
 
 class LiveConsumer(ModelEventSink):
@@ -107,8 +112,12 @@ class LiveConsumer(ModelEventSink):
         # in `on_complete` when a parent's output contains Task/Agent tool_calls
         # (synchronously, before the response is sent back to Claude Code, so
         # the entry is ready before any sub-agent can make a bridge call).
-        # Cleared in `_handle_user` when the matching tool_result arrives.
+        # Cleared when the sub-agent finishes (see `_close_agent`).
         self._pending_subagents: dict[str, str] = {}
+
+        # background agent task_id → tool_use_id, for task_notifications that
+        # carry no tool_use_id
+        self._task_ids: dict[str, str] = {}
 
         # Track which event objects we've already _event()'d so on_complete
         # knows whether to emit _event_updated (yes if we emitted) vs swallow
@@ -148,6 +157,7 @@ class LiveConsumer(ModelEventSink):
             agent = self._open_agents.pop(tool_use_id)
             transcript()._event(SpanEndEvent(id=agent.span_id))
         self._pending_subagents.clear()
+        self._task_ids.clear()
         self._emitted_events.clear()
         self._last_stop_reason = None
 
@@ -197,7 +207,10 @@ class LiveConsumer(ModelEventSink):
                     # idempotent — defensive against retries
                     continue
                 agent_span_id = f"agent-{tc.id}"
-                self._open_agents[tc.id] = _OpenAgent(span_id=agent_span_id)
+                self._open_agents[tc.id] = _OpenAgent(
+                    span_id=agent_span_id,
+                    parent_text=self._first_user_text(event.input),
+                )
                 self._pending_subagents[tc.id] = prompt
                 span_name = args.get("subagent_type") or args.get("name") or "agent"
                 description = args.get("description") or ""
@@ -258,8 +271,12 @@ class LiveConsumer(ModelEventSink):
         for tool_use_id, prompt in self._pending_subagents.items():
             if len(prompt) < _MIN_PROMPT_LENGTH:
                 continue
-            if prompt in user_text:
-                matches.append(tool_use_id)
+            if prompt not in user_text:
+                continue
+            agent = self._open_agents.get(tool_use_id)
+            if agent is not None and agent.parent_text == user_text:
+                continue  # the launching parent itself, still running
+            matches.append(tool_use_id)
 
         if len(matches) == 1:
             agent = self._open_agents.get(matches[0])
@@ -289,28 +306,39 @@ class LiveConsumer(ModelEventSink):
         if not isinstance(content, list):
             return
 
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") != "tool_result":
-                continue
-            tool_use_id = block.get("tool_use_id")
-            if not tool_use_id:
-                continue
-            if tool_use_id in self._open_agents and _is_async_launch(raw, block):
-                # background agent: still running, close on task_notification
-                continue
+        blocks = [
+            b
+            for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "tool_result"
+            and b.get("tool_use_id")
+        ]
+        # `tool_use_result` describes one tool's output, so only trust it
+        # when it can belong to just this block
+        structured = raw.get("tool_use_result") if len(blocks) == 1 else None
+        for block in blocks:
+            tool_use_id = str(block["tool_use_id"])
+            if tool_use_id in self._open_agents:
+                task_id = _async_launch_task_id(
+                    structured, block, self._pending_subagents.get(tool_use_id)
+                )
+                if task_id is not None:
+                    # background agent: still running, close on task_notification
+                    if task_id:
+                        self._task_ids[task_id] = tool_use_id
+                    continue
             self._close_agent(tool_use_id)
 
     def _close_agent(self, tool_use_id: str) -> None:
         # Clear pending-subagent entry (no-op for non-Task tool_results).
         self._pending_subagents.pop(tool_use_id, None)
+        self._task_ids = {k: v for k, v in self._task_ids.items() if v != tool_use_id}
         agent = self._open_agents.pop(tool_use_id, None)
         if agent is not None:
             transcript()._event(SpanEndEvent(id=agent.span_id))
 
     def _handle_system(self, raw: dict[str, Any]) -> None:
-        """Handle system events (only compaction boundaries today).
+        """Handle compaction boundaries and background-agent completion.
 
         `task_started` is ignored: registration happens in `on_complete`
         (synchronous with the parent's bridge call, ahead of any race).
@@ -322,7 +350,9 @@ class LiveConsumer(ModelEventSink):
             self._handle_compact_boundary(raw)
         elif subtype == "task_notification":
             tool_use_id = raw.get("tool_use_id")
-            if isinstance(tool_use_id, str):
+            if not isinstance(tool_use_id, str):
+                tool_use_id = self._task_ids.get(str(raw.get("task_id")))
+            if tool_use_id is not None:
                 self._close_agent(tool_use_id)
 
     def _handle_compact_boundary(self, raw: dict[str, Any]) -> None:
@@ -347,18 +377,31 @@ class LiveConsumer(ModelEventSink):
         )
 
 
-def _is_async_launch(raw: dict[str, Any], block: dict[str, Any]) -> bool:
-    """Whether a Task/Agent tool_result acknowledges a background launch.
+def _async_launch_task_id(
+    structured: Any, block: dict[str, Any], prompt: str | None
+) -> str | None:
+    """Task id ("" if unknown) if a Task/Agent tool_result is a background launch ack.
 
-    Prefers the structured `tool_use_result` Claude Code attaches to the
-    JSONL `user` line; falls back to the result text.
+    Returns None if it is not one: the sub-agent has finished. Only
+    `async_launched` agents keep running locally; `remote_launched` agents run
+    in the cloud and never call the bridge, so their span closes at launch.
+    Prefers the structured `tool_use_result` Claude Code attaches to the JSONL
+    `user` line (checked against the prompt it echoes); falls back to the
+    result text.
     """
-    result = raw.get("tool_use_result")
-    if isinstance(result, dict) and "status" in result:
-        return result["status"] in ("async_launched", "remote_launched")
+    if (
+        isinstance(structured, dict)
+        and "status" in structured
+        and structured.get("prompt") == prompt
+    ):
+        if structured["status"] != "async_launched":
+            return None
+        return str(structured.get("agentId") or "")
     content = block.get("content")
     if isinstance(content, list):
-        content = " ".join(
-            str(c.get("text", "")) for c in content if isinstance(c, dict)
+        content = next(
+            (str(c.get("text", "")) for c in content if isinstance(c, dict)), ""
         )
-    return isinstance(content, str) and "Async agent launched" in content
+    if isinstance(content, str) and content.lstrip().startswith("Async agent launched"):
+        return ""
+    return None

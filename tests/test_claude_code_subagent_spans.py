@@ -8,6 +8,7 @@ calls; completion arrives later as a `task_notification` system event.
 
 from typing import Any
 
+import pytest
 from inspect_ai.event import SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.model import GenerateConfig, ModelOutput
@@ -40,7 +41,7 @@ class _TranscriptStub:
         return [e for e in self.events if isinstance(e, SpanEndEvent)]
 
 
-def _consumer(monkeypatch: Any) -> tuple[LiveConsumer, _TranscriptStub]:
+def _consumer(monkeypatch: pytest.MonkeyPatch) -> tuple[LiveConsumer, _TranscriptStub]:
     stub = _TranscriptStub()
     monkeypatch.setattr(consumer_module, "transcript", lambda: stub)
     monkeypatch.setattr(consumer_module, "current_span_id", lambda: "outer")
@@ -68,85 +69,122 @@ def _call(consumer: LiveConsumer, event: ModelEvent) -> ModelEvent:
     return event
 
 
-def _launch(consumer: LiveConsumer, background: bool) -> None:
+PROMPT_2 = "Run the test suite and report which tests fail and why."
+MAIN_TASK = "main task"
+
+
+# Background vs foreground is decided by the tool_result Claude Code returns,
+# not by the `run_in_background` argument, so launches don't set it.
+def _launch(
+    consumer: LiveConsumer,
+    prompts: dict[str, str] | None = None,
+    function: str = "Agent",
+    main_task: str = MAIN_TASK,
+) -> None:
+    prompts = prompts or {"toolu_1": PROMPT}
     _call(
         consumer,
         _model_event(
-            [ChatMessageUser(content="main task")],
+            [ChatMessageUser(content=main_task)],
             [
                 ToolCall(
-                    id="toolu_1",
-                    function="Agent",
-                    arguments={
-                        "prompt": PROMPT,
-                        "subagent_type": "Explore",
-                        "run_in_background": background,
-                    },
+                    id=tool_use_id,
+                    function=function,
+                    arguments={"prompt": prompt, "subagent_type": "Explore"},
                 )
+                for tool_use_id, prompt in prompts.items()
             ],
         ),
     )
 
 
-def _subagent_call(consumer: LiveConsumer) -> ModelEvent:
-    return _call(consumer, _model_event([ChatMessageUser(content=PROMPT)]))
+def _subagent_call(consumer: LiveConsumer, prompt: str = PROMPT) -> ModelEvent:
+    return _call(consumer, _model_event([ChatMessageUser(content=prompt)]))
 
 
-def _tool_result_line(text: str, tool_use_result: Any) -> dict[str, Any]:
-    return {
+def _result_block(text: str, tool_use_id: str = "toolu_1") -> dict[str, Any]:
+    return {"type": "tool_result", "tool_use_id": tool_use_id, "content": text}
+
+
+def _user_line(blocks: list[dict[str, Any]], tool_use_result: Any) -> dict[str, Any]:
+    line: dict[str, Any] = {
         "type": "user",
-        "message": {
-            "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_1", "content": text}
-            ],
-        },
-        "tool_use_result": tool_use_result,
+        "message": {"role": "user", "content": blocks},
     }
+    if tool_use_result is not None:
+        line["tool_use_result"] = tool_use_result
+    return line
 
 
-ASYNC_ACK = _tool_result_line(
-    "Async agent launched successfully.\nagentId: a1b2c3",
-    {
-        "status": "async_launched",
-        "agentId": "a1b2c3",
-        "description": "Find TODOs",
-        "prompt": PROMPT,
-        "outputFile": "/tmp/a1b2c3.output",
-    },
-)
-
-TASK_NOTIFICATION = {
-    "type": "system",
-    "subtype": "task_notification",
-    "task_id": "a1b2c3",
-    "tool_use_id": "toolu_1",
-    "status": "completed",
-    "output_file": "/tmp/a1b2c3.output",
-    "summary": "Found 3 TODOs",
-}
+def _tool_result_line(
+    text: str, tool_use_result: Any, tool_use_id: str = "toolu_1"
+) -> dict[str, Any]:
+    return _user_line([_result_block(text, tool_use_id)], tool_use_result)
 
 
-def test_foreground_subagent_span_closes_on_tool_result(monkeypatch: Any) -> None:
+def _async_ack(
+    tool_use_id: str = "toolu_1",
+    prompt: str = PROMPT,
+    agent_id: str = "a1b2c3",
+    status: str = "async_launched",
+) -> dict[str, Any]:
+    return _tool_result_line(
+        f"Async agent launched successfully.\nagentId: {agent_id}",
+        {
+            "status": status,
+            "agentId": agent_id,
+            "description": "Find TODOs",
+            "prompt": prompt,
+            "outputFile": f"/tmp/{agent_id}.output",
+        },
+        tool_use_id,
+    )
+
+
+def _notification(
+    tool_use_id: str | None = "toolu_1",
+    task_id: str = "a1b2c3",
+    status: str = "completed",
+) -> dict[str, Any]:
+    line: dict[str, Any] = {
+        "type": "system",
+        "subtype": "task_notification",
+        "task_id": task_id,
+        "status": status,
+        "output_file": f"/tmp/{task_id}.output",
+        "summary": "done",
+    }
+    if tool_use_id is not None:
+        line["tool_use_id"] = tool_use_id
+    return line
+
+
+ASYNC_ACK = _async_ack()
+TASK_NOTIFICATION = _notification()
+
+
+def test_foreground_subagent_span_closes_on_tool_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     consumer, stub = _consumer(monkeypatch)
-    _launch(consumer, background=False)
+    _launch(consumer)
     [begin] = stub.span_begins()
     assert (begin.type, begin.name, begin.parent_id) == ("agent", "Explore", "outer")
 
     assert _subagent_call(consumer).span_id == begin.id
 
     consumer.process_jsonl_line(
-        _tool_result_line("Found 3 TODOs", {"status": "completed"})
+        _tool_result_line("Found 3 TODOs", {"status": "completed", "prompt": PROMPT})
     )
     assert [e.id for e in stub.span_ends()] == [begin.id]
     assert _subagent_call(consumer).span_id == "outer"
 
 
 def test_background_subagent_stays_in_own_span_after_launch_ack(
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     consumer, stub = _consumer(monkeypatch)
-    _launch(consumer, background=True)
+    _launch(consumer)
     [begin] = stub.span_begins()
 
     consumer.process_jsonl_line(ASYNC_ACK)
@@ -155,7 +193,7 @@ def test_background_subagent_stays_in_own_span_after_launch_ack(
     # sub-agent keeps working after the parent got its acknowledgement
     assert _subagent_call(consumer).span_id == begin.id
     # the parent's own calls still land on the outer span
-    parent = _call(consumer, _model_event([ChatMessageUser(content="main task")]))
+    parent = _call(consumer, _model_event([ChatMessageUser(content=MAIN_TASK)]))
     assert parent.span_id == "outer"
 
     consumer.process_jsonl_line(TASK_NOTIFICATION)
@@ -164,20 +202,144 @@ def test_background_subagent_stays_in_own_span_after_launch_ack(
 
 
 def test_background_ack_detected_from_text_without_structured_result(
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     consumer, stub = _consumer(monkeypatch)
-    _launch(consumer, background=True)
+    _launch(consumer)
     line = dict(ASYNC_ACK)
     del line["tool_use_result"]
     consumer.process_jsonl_line(line)
     assert stub.span_ends() == []
 
 
-def test_reset_closes_background_subagent_still_running(monkeypatch: Any) -> None:
+def test_reset_closes_background_subagent_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     consumer, stub = _consumer(monkeypatch)
-    _launch(consumer, background=True)
+    _launch(consumer)
     consumer.process_jsonl_line(ASYNC_ACK)
     consumer.reset()
     [begin] = stub.span_begins()
     assert [e.id for e in stub.span_ends()] == [begin.id]
+
+
+def _ends(stub: _TranscriptStub) -> list[str]:
+    return [e.id for e in stub.span_ends()]
+
+
+def test_task_tool_name_opens_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer, function="Task")
+    consumer.process_jsonl_line(ASYNC_ACK)
+    assert _subagent_call(consumer).span_id == "agent-toolu_1"
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "stopped"])
+def test_any_notification_status_closes(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(ASYNC_ACK)
+    consumer.process_jsonl_line(_notification(status=status))
+    assert _ends(stub) == ["agent-toolu_1"]
+
+
+def test_notification_before_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(TASK_NOTIFICATION)
+    consumer.process_jsonl_line(ASYNC_ACK)
+    assert _ends(stub) == ["agent-toolu_1"]
+    assert _subagent_call(consumer).span_id == "outer"
+
+
+def test_unknown_notification_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(ASYNC_ACK)
+    consumer.process_jsonl_line(_notification(tool_use_id="toolu_other"))
+    consumer.process_jsonl_line(_notification(tool_use_id=None, task_id="zzz"))
+    assert _ends(stub) == []
+
+
+def test_notification_without_tool_use_id_closes_by_task_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(ASYNC_ACK)
+    consumer.process_jsonl_line(_notification(tool_use_id=None))
+    assert _ends(stub) == ["agent-toolu_1"]
+
+
+def test_concurrent_background_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer, {"toolu_1": PROMPT, "toolu_2": PROMPT_2})
+    consumer.process_jsonl_line(ASYNC_ACK)
+    consumer.process_jsonl_line(_async_ack("toolu_2", PROMPT_2, "d4e5f6"))
+    assert _subagent_call(consumer, PROMPT).span_id == "agent-toolu_1"
+    assert _subagent_call(consumer, PROMPT_2).span_id == "agent-toolu_2"
+
+    consumer.process_jsonl_line(_notification("toolu_2", "d4e5f6"))
+    assert _ends(stub) == ["agent-toolu_2"]
+    assert _subagent_call(consumer, PROMPT).span_id == "agent-toolu_1"
+    assert _subagent_call(consumer, PROMPT_2).span_id == "outer"
+
+
+def test_remote_launched_closes_at_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(status="remote_launched"))
+    assert _ends(stub) == ["agent-toolu_1"]
+
+
+def test_multi_block_line_ignores_line_level_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer, {"toolu_1": PROMPT, "toolu_2": PROMPT_2})
+    # toolu_1 is acknowledged as background, toolu_2 finished in the
+    # foreground; the line-level result describes only one of them
+    consumer.process_jsonl_line(
+        _user_line(
+            [
+                _result_block("Async agent launched successfully.", "toolu_1"),
+                _result_block("All tests pass.", "toolu_2"),
+            ],
+            {"status": "async_launched", "agentId": "a1b2c3", "prompt": PROMPT},
+        )
+    )
+    assert _ends(stub) == ["agent-toolu_2"]
+
+
+def test_parent_quoting_prompt_stays_on_outer_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    main_task = f"Please do this. {PROMPT} Then fix them."
+    _launch(consumer, main_task=main_task)
+    consumer.process_jsonl_line(ASYNC_ACK)
+    parent = _call(consumer, _model_event([ChatMessageUser(content=main_task)]))
+    assert parent.span_id == "outer"
+    assert _subagent_call(consumer).span_id == "agent-toolu_1"
+
+
+def test_foreground_error_result_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(
+        _tool_result_line("Error: agent failed", "Error: agent failed")
+    )
+    assert _ends(stub) == ["agent-toolu_1"]
+
+
+def test_foreground_report_mentioning_launch_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(
+        _tool_result_line("Done. Async agent launched for the docs earlier.", None)
+    )
+    assert _ends(stub) == ["agent-toolu_1"]
