@@ -703,10 +703,9 @@ def _run_boundaries(history: list[ChatMessage]) -> int:
     """Finished runs visible in a sub-agent's history.
 
     A run ends with a text-only assistant turn; a resumed run continues the
-    same history with a new user turn after it. Claude Code can also add a
-    user turn inside one run (max-output-tokens recovery, a blocking
-    SubagentStop hook); that splits the run's span in two, and the second
-    stays open until `reset()`.
+    same history with a new user turn after it. User turns Claude Code adds
+    to keep one run going (max-output-tokens recovery, a blocking Stop or
+    SubagentStop hook) are not boundaries.
     """
     return sum(
         1
@@ -714,7 +713,16 @@ def _run_boundaries(history: list[ChatMessage]) -> int:
         if isinstance(prev, ChatMessageAssistant)
         and not prev.tool_calls
         and isinstance(nxt, ChatMessageUser)
+        and not any(marker in nxt.text for marker in _IN_RUN_USER_MARKERS)
     )
+
+
+# Text of the user turns Claude Code (2.1.303) adds within a run.
+_IN_RUN_USER_MARKERS = (
+    "Output token limit hit",
+    "Stop hook feedback",
+    "hook blocking error from command",
+)
 
 
 def _block_text(block: dict[str, Any]) -> str:

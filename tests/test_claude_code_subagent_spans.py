@@ -885,3 +885,29 @@ def test_task_started_for_new_run_rolls_over(monkeypatch: pytest.MonkeyPatch) ->
     assert _ends(stub) == ["agent-toolu_1"]
     consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r2"})
     assert _ends(stub) == ["agent-toolu_1", "agent-toolu_1-run2"]
+
+
+@pytest.mark.parametrize(
+    "injected",
+    [
+        "Output token limit hit. Resume directly — no apology, no recap.",
+        'SubagentStop hook blocking error from command "check.sh": not done',
+        "Stop hook feedback:\nkeep going",
+    ],
+)
+def test_in_run_user_turn_is_not_a_new_run(
+    monkeypatch: pytest.MonkeyPatch, injected: str
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_started("aid", "toolu_1", "r1"))
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    history: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="partial"),
+        ChatMessageUser(content=injected),
+    ]
+    assert _call(consumer, _model_event(history)).span_id == "agent-toolu_1"
+    consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r1"})
+    assert _ends(stub) == ["agent-toolu_1"]
+    assert len(stub.span_begins()) == 1
