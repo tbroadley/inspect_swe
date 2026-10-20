@@ -299,9 +299,27 @@ class LiveConsumer(ModelEventSink):
                 else:
                     self._open_span(tc.id, origin, parent_span_id)
 
+        if self._close_from_input_enabled:
+            self._close_finished_run(event)
+
         if id(event) in self._emitted_events:
             self._emitted_events.discard(id(event))
             transcript()._event_updated(event)
+
+    def _close_finished_run(self, event: ModelEvent) -> None:
+        """Close a sub-agent's span when its run ends (ACP only).
+
+        A run ends with a text-only `end_turn` reply. Without this, a
+        background agent's span would wait for the parent's next request to
+        show the notification, which in an idle interactive session can be
+        much later. A resume later opens the next run lazily.
+        """
+        msg = event.output.message if event.output and event.output.choices else None
+        if msg is None or msg.tool_calls or event.output.stop_reason != "stop":
+            return
+        for key, agent in list(self._open_agents.items()):
+            if agent.span_id == event.span_id:
+                self._close_agent(key)
 
     def _open_span(
         self,

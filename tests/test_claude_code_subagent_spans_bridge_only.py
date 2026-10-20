@@ -79,7 +79,11 @@ def _call(
     consumer: LiveConsumer,
     input: list[ChatMessage],
     tool_calls: list[ToolCall] | None = None,
+    final: bool = False,
 ) -> str | None:
+    # a mid-run call ends in a tool call; a run's final reply is text only
+    if tool_calls is None and not final:
+        tool_calls = [ToolCall(id="toolu_bash", function="Bash", arguments={})]
     event = ModelEvent(
         model="anthropic/claude-haiku-4-5",
         input=input,
@@ -265,4 +269,39 @@ def test_cli_consumer_does_not_close_from_input(
     consumer = LiveConsumer()
     _launch(consumer)
     _parent(consumer, ChatMessageTool(content="21 lines.", tool_call_id="toolu_1"))
+    assert stub.ends() == []
+
+
+def test_final_reply_closes_background_run_without_parent_request(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    _parent(consumer, ChatMessageTool(content=ACK, tool_call_id="toolu_1"))
+    assert _subagent(consumer) == "agent-toolu_1"
+    final = _call(consumer, [ChatMessageUser(content=PROMPT)], final=True)
+    assert final == "agent-toolu_1"
+    assert stub.ends() == ["agent-toolu_1"]
+
+
+def test_resume_after_final_reply_opens_next_run(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    _call(consumer, [ChatMessageUser(content=PROMPT)], final=True)
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="21 lines."),
+        ChatMessageUser(content="The coordinator sent a message: more"),
+    ]
+    assert _call(consumer, resumed) == "agent-toolu_1-run2"
+
+
+def test_parent_final_reply_closes_nothing(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH], final=True)
     assert stub.ends() == []
