@@ -13,8 +13,12 @@ from inspect_swe.acp.agent import ACPAgent
 
 
 class _FakeAgent(ACPAgent):
+    start_cwds: list[str]
+
     @asynccontextmanager
     async def _start_agent(self, state: AgentState) -> AsyncIterator[Any]:
+        # subclasses build paths from self.cwd here, so it must be resolved
+        self.start_cwds = [*getattr(self, "start_cwds", []), self.cwd]
         bridge = SimpleNamespace(
             mcp_server_configs=[], state=SimpleNamespace(messages=[], output=None)
         )
@@ -31,6 +35,7 @@ def fake_acp(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             pass
 
         async def new_session(self, cwd: str, **kwargs: Any) -> Any:
+            await anyio.sleep(0)  # a real round trip suspends
             session_cwds.append(cwd)
             return SimpleNamespace(session_id="sess-1")
 
@@ -39,6 +44,7 @@ def fake_acp(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         yield _Conn(), None, None
 
     async def _resolve(sandbox: Any, user: str | None, cwd: str | None) -> str:
+        await anyio.sleep(0)  # a real resolution execs in the sandbox
         return cwd or "/root"
 
     async def _wait_forever(self: ACPAgent, feeder: Any, error_info: Any) -> None:
@@ -84,6 +90,7 @@ async def test_cwd_defaults_to_sandbox_resolution(fake_acp: list[str]) -> None:
     agent = _FakeAgent(model="m")
     await _start(agent)
     assert fake_acp == ["/root"]
+    assert agent.start_cwds == ["/root"]
 
 
 @pytest.mark.anyio
@@ -91,3 +98,4 @@ async def test_explicit_cwd_is_kept(fake_acp: list[str]) -> None:
     agent = _FakeAgent(model="m", cwd="/work")
     await _start(agent)
     assert fake_acp == ["/work"]
+    assert agent.start_cwds == ["/work"]

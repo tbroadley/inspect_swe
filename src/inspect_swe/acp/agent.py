@@ -201,10 +201,6 @@ class ACPAgent(Agent):
     async def __call__(
         self, state: AgentState, *args: Any, **kwargs: Any
     ) -> AgentState:
-        # keep the event a caller may already be waiting on; only a re-run
-        # (after a previous session signalled it) needs a fresh one
-        if self.ready.is_set():
-            self.ready = anyio.Event()
         try:
             self.cwd = await resolve_agent_cwd(
                 sandbox_env(self.sandbox), self.user, self._cwd_arg
@@ -265,6 +261,10 @@ class ACPAgent(Agent):
                             await self._wait_for_active_session(feeder, error_info)
                         finally:
                             self.conn = None
+                            # fresh event for the next run, made here (not at
+                            # the start of the next call) so a caller that
+                            # starts waiting before that call waits on it
+                            self.ready = anyio.Event()
                             self.session_id = None
                 finally:
                     state.messages = bridge.state.messages
