@@ -713,16 +713,61 @@ def _run_boundaries(history: list[ChatMessage]) -> int:
         if isinstance(prev, ChatMessageAssistant)
         and not prev.tool_calls
         and isinstance(nxt, ChatMessageUser)
-        and not any(marker in nxt.text for marker in _IN_RUN_USER_MARKERS)
+        and not _is_in_run_user_turn(nxt)
     )
 
 
-# Text of the user turns Claude Code (2.1.303) adds within a run.
-_IN_RUN_USER_MARKERS = (
+# Starts of the user turns Claude Code (2.1.303) adds to keep a run going:
+# its own classifier (exact messages and prefixes) for retry, recovery and
+# hook-feedback turns, plus hook blocking errors.
+_IN_RUN_USER_PREFIXES = (
+    # exact messages (matched by their opening words)
+    "The previous response failed to produce a valid tool call.",
+    "Your tool call was malformed and could not be parsed.",
+    "[Your previous response had no visible output.",
+    "The PermissionDenied hook indicated you may retry this tool call.",
+    "The turn did not end: a tool call in your last message asked to end it",
+    "Your response above was stopped by a safety classifier",
     "Output token limit hit",
-    "Stop hook feedback",
-    "hook blocking error from command",
+    "[Your previous response reached the output limit with no visible output.",
+    "Your response was cut off because it exceeded the output token limit.",
+    "Your response above was cut off mid-stream.",
+    # prefixes
+    "[structured-output-enforce]",
+    "[projects-reply-gate]",
+    "You ended the turn without calling SendUserMessage.",
+    "Goal check-in: \u00ab",
+    # hook feedback
+    "Stop hook feedback:",
+    "TeammateIdle hook feedback:",
+    "TaskCreated hook feedback:",
+    "TaskCompleted hook feedback:",
 )
+_HOOK_BLOCKING_ERROR = re.compile(r"^\w+ hook blocking error from command")
+
+
+def _is_in_run_user_turn(message: ChatMessageUser) -> bool:
+    """Whether a user turn is one Claude Code adds within a run.
+
+    Like Claude Code, matches the start of the first text block, skipping
+    blocks that are only a `<system-reminder>`.
+    """
+    contents = (
+        [message.content] if isinstance(message.content, str) else message.content
+    )
+    for content in contents:
+        text = content if isinstance(content, str) else getattr(content, "text", None)
+        if not isinstance(text, str):
+            continue
+        text = text.lstrip()
+        if text.startswith("<system-reminder>") and text.rstrip().endswith(
+            "</system-reminder>"
+        ):
+            continue
+        return text.startswith(_IN_RUN_USER_PREFIXES) or bool(
+            _HOOK_BLOCKING_ERROR.match(text)
+        )
+    return False
 
 
 def _block_text(block: dict[str, Any]) -> str:

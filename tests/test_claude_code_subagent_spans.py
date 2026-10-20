@@ -9,6 +9,7 @@ calls; completion arrives later as a `task_notification` system event.
 from typing import Any
 
 import pytest
+from inspect_ai._util.content import ContentText
 from inspect_ai.event import SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.model import GenerateConfig, ModelOutput
@@ -890,9 +891,28 @@ def test_task_started_for_new_run_rolls_over(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.parametrize(
     "injected",
     [
+        # verbatim openings from Claude Code 2.1.303
         "Output token limit hit. Resume directly — no apology, no recap.",
-        'SubagentStop hook blocking error from command "check.sh": not done',
+        "Output token limit hit while you were still reasoning, before this "
+        "response produced any text or tool call.",
+        "Your response was cut off because it exceeded the output token limit. "
+        "Continue from where you left off.",
+        "[Your previous response reached the output limit with no visible "
+        "output. Please continue and produce a brief user-visible response.]",
+        "Your response above was cut off mid-stream. Resume directly.",
+        "[Your previous response had no visible output. Please continue and "
+        "produce a user-visible response.]",
+        "Your response above was stopped by a safety classifier — this is not "
+        "a tool or API error.",
+        "The previous response failed to produce a valid tool call. Please "
+        "retry the tool call now.",
+        "Goal check-in: «finish the report»",
+        "[structured-output-enforce] call the StructuredOutput tool",
+        "You ended the turn without calling SendUserMessage.",
         "Stop hook feedback:\nkeep going",
+        "TaskCompleted hook feedback:\nnot done",
+        'SubagentStop hook blocking error from command: "check.sh": not done',
+        'Stop hook blocking error from command "check.sh": out',
     ],
 )
 def test_in_run_user_turn_is_not_a_new_run(
@@ -910,4 +930,42 @@ def test_in_run_user_turn_is_not_a_new_run(
     assert _call(consumer, _model_event(history)).span_id == "agent-toolu_1"
     consumer.process_jsonl_line({**_notification("toolu_1", "aid"), "run_id": "r1"})
     assert _ends(stub) == ["agent-toolu_1"]
+    assert len(stub.span_begins()) == 1
+
+
+def test_resume_quoting_an_in_run_message_is_still_a_new_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # only the start of the turn counts, as in Claude Code
+    consumer, _ = _consumer(monkeypatch)
+    _launch(consumer)
+    consumer.process_jsonl_line(_async_ack(agent_id="aid"))
+    consumer.process_jsonl_line(_notification(task_id="aid"))
+    history: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="done"),
+        ChatMessageUser(
+            content="The coordinator sent a message: the log says "
+            "'Output token limit hit', please retry"
+        ),
+    ]
+    assert _call(consumer, _model_event(history)).span_id == "agent-toolu_1-run2"
+
+
+def test_in_run_turn_after_system_reminder_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer, stub = _consumer(monkeypatch)
+    _launch(consumer)
+    history: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="partial"),
+        ChatMessageUser(
+            content=[
+                ContentText(text="<system-reminder>\nnote\n</system-reminder>"),
+                ContentText(text="Output token limit hit. Resume directly."),
+            ]
+        ),
+    ]
+    assert _call(consumer, _model_event(history)).span_id == "agent-toolu_1"
     assert len(stub.span_begins()) == 1
