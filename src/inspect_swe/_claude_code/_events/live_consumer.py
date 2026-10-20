@@ -737,6 +737,8 @@ _IN_RUN_USER_PREFIXES = (
     "[projects-reply-gate]",
     "You ended the turn without calling SendUserMessage.",
     "Goal check-in: \u00ab",
+    # auto-compaction's summary request (a separate call within the run)
+    "Your task is to create a detailed summary of the conversation so far",
     # hook feedback
     "Stop hook feedback:",
     "TeammateIdle hook feedback:",

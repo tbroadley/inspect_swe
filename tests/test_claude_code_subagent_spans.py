@@ -907,6 +907,8 @@ def test_task_started_for_new_run_rolls_over(monkeypatch: pytest.MonkeyPatch) ->
         "The previous response failed to produce a valid tool call. Please "
         "retry the tool call now.",
         "Goal check-in: «finish the report»",
+        "Your task is to create a detailed summary of the conversation so far, "
+        "paying close attention to the user's explicit requests.",
         "[structured-output-enforce] call the StructuredOutput tool",
         "You ended the turn without calling SendUserMessage.",
         "Stop hook feedback:\nkeep going",
