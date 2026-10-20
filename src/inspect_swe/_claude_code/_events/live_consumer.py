@@ -135,6 +135,13 @@ class _Launched:
     agent_id: str | None = None
     fork: bool = False
     runs: int = 0
+    # ACP only: launched in the background (its end is also notified)
+    background: bool = False
+    # ACP only: the latest run's span was closed by the sub-agent's own final
+    # reply. Calls can still follow in that run (a hook or a compaction keeps
+    # it going), and stay in its span; and its notification is still to come
+    closed_by_reply: bool = False
+    pending_notifications: int = 0
     # SendMessage seen while the previous run still looked open; keys the
     # run it starts if that run opens lazily
     pending_send: str | None = None
@@ -312,14 +319,21 @@ class LiveConsumer(ModelEventSink):
         A run ends with a text-only `end_turn` reply. Without this, a
         background agent's span would wait for the parent's next request to
         show the notification, which in an idle interactive session can be
-        much later. A resume later opens the next run lazily.
+        much later. A resume later opens the next run lazily. A compaction
+        summary is a text-only reply too, but not the end of the run.
         """
         msg = event.output.message if event.output and event.output.choices else None
         if msg is None or msg.tool_calls or event.output.stop_reason != "stop":
             return
+        if _is_compaction_request(event.input):
+            return
         for key, agent in list(self._open_agents.items()):
             if agent.span_id == event.span_id:
+                launched = self._launched[agent.origin]
                 self._close_agent(key)
+                launched.closed_by_reply = True
+                if launched.background:
+                    launched.pending_notifications += 1
 
     def _open_span(
         self,
@@ -333,6 +347,7 @@ class LiveConsumer(ModelEventSink):
         resumed = launched.runs > 0
         launched.runs += 1
         launched.pending_send = None
+        launched.closed_by_reply = False
         span_id = f"agent-{origin}-run{launched.runs}" if resumed else f"agent-{origin}"
         parent_span_id = parent_span_id or launched.parent_span_id
         agent = _OpenAgent(
@@ -405,6 +420,7 @@ class LiveConsumer(ModelEventSink):
                 elif text.startswith("Fork started"):
                     continue
                 elif text.startswith("Async agent launched"):
+                    self._launched[agent.origin].background = True
                     agent_id = self._launched[agent.origin].agent_id
                     if agent_id:
                         self._task_ids[agent_id] = tool_use_id
@@ -412,6 +428,13 @@ class LiveConsumer(ModelEventSink):
                 self._close_agent(tool_use_id)
             elif isinstance(msg, ChatMessageUser):
                 for note in _TASK_NOTIFICATION.findall(msg.text):
+                    origin = self._find_launched(_xml_field(note, "task-id"))
+                    if origin is not None:
+                        launched = self._launched[origin]
+                        if launched.pending_notifications > 0:
+                            # for a run its own reply already closed
+                            launched.pending_notifications -= 1
+                            continue
                     key = _xml_field(note, "tool-use-id")
                     if key in self._seen_keys and key not in self._open_agents:
                         continue  # a run we already closed or rolled past
@@ -538,7 +561,11 @@ class LiveConsumer(ModelEventSink):
             and launched.prompt in user_text
             and origin not in launched_here
             # a finished agent only matches a call that shows a resume
-            and (self._is_open(origin) or boundaries >= 1)
+            and (
+                self._is_open(origin)
+                or boundaries >= 1
+                or self._launched[origin].closed_by_reply
+            )
         ]
         best = self._best_match(matches, boundaries)
         if best is None:
@@ -891,3 +918,13 @@ _TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>",
 def _xml_field(text: str, tag: str) -> str | None:
     m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.S)
     return m.group(1).strip() if m else None
+
+
+_COMPACTION_REQUEST = (
+    "Your task is to create a detailed summary of the conversation so far"
+)
+
+
+def _is_compaction_request(input_messages: list[ChatMessage]) -> bool:
+    last = input_messages[-1] if input_messages else None
+    return isinstance(last, ChatMessageUser) and _COMPACTION_REQUEST in last.text

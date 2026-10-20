@@ -305,3 +305,156 @@ def test_parent_final_reply_closes_nothing(
     _launch(consumer)
     _call(consumer, [ChatMessageUser(content=MAIN), LAUNCH], final=True)
     assert stub.ends() == []
+
+
+def _final(
+    consumer: LiveConsumer, input: list[ChatMessage], stop_reason: str = "stop"
+) -> str | None:
+    event = ModelEvent(
+        model="anthropic/claude-haiku-4-5",
+        input=input,
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput.from_message(
+            ChatMessageAssistant(content="done"),
+            stop_reason=stop_reason,  # type: ignore[arg-type]
+        ),
+    )
+    consumer.on_pending(event)
+    consumer.on_complete(event)
+    return event.span_id
+
+
+def _background(consumer: LiveConsumer) -> ChatMessageTool:
+    _launch(consumer)
+    ack = ChatMessageTool(content=ACK, tool_call_id="toolu_1")
+    _parent(consumer, ack)
+    return ack
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "Stop hook feedback:\nnot done yet",
+        "Your task is to create a detailed summary of the conversation so far",
+    ],
+)
+def test_run_continued_after_its_final_reply_stays_in_its_span(
+    setup: tuple[LiveConsumer, _TranscriptStub], continuation: str
+) -> None:
+    consumer, stub = setup
+    _background(consumer)
+    history: list[ChatMessage] = [ChatMessageUser(content=PROMPT)]
+    assert _final(consumer, history) == "agent-toolu_1"
+    history += [
+        ChatMessageAssistant(content="done"),
+        ChatMessageUser(content=continuation),
+    ]
+    assert _call(consumer, history) == "agent-toolu_1"
+    assert stub.begins() == ["agent-toolu_1"]
+
+
+def test_compaction_summary_reply_does_not_close(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _background(consumer)
+    summary_request: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageUser(
+            content="Your task is to create a detailed summary of the "
+            "conversation so far, paying close attention to the user's requests"
+        ),
+    ]
+    assert _final(consumer, summary_request) == "agent-toolu_1"
+    assert stub.ends() == []
+
+
+def test_notification_after_reply_close_does_not_close_next_run(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    # 2.1.303 lets a sub-agent end its turn while its own children run, and
+    # resume when they finish; run 1's notification can then arrive in run 2
+    consumer, stub = setup
+    ack = _background(consumer)
+    _final(consumer, [ChatMessageUser(content=PROMPT)])
+    resumed: list[ChatMessage] = [
+        ChatMessageUser(content=PROMPT),
+        ChatMessageAssistant(content="waiting on my agents"),
+        ChatMessageUser(
+            content=_notification("toolu_child").replace(AGENT_ID, "a-child")
+        ),
+    ]
+    assert _call(consumer, resumed) == "agent-toolu_1-run2"
+    _parent(
+        consumer,
+        ack,
+        ChatMessageAssistant(content="w"),
+        ChatMessageUser(content=_notification("toolu_1")),
+    )
+    assert stub.ends() == ["agent-toolu_1"]
+    assert _call(consumer, resumed) == "agent-toolu_1-run2"
+
+
+def test_notification_after_reply_close_is_not_a_second_end(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    ack = _background(consumer)
+    _final(consumer, [ChatMessageUser(content=PROMPT)])
+    _parent(
+        consumer,
+        ack,
+        ChatMessageAssistant(content="w"),
+        ChatMessageUser(content=_notification("toolu_1")),
+    )
+    assert stub.ends() == ["agent-toolu_1"]
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "content_filter", "unknown"])
+def test_text_reply_that_is_not_an_end_turn_does_not_close(
+    setup: tuple[LiveConsumer, _TranscriptStub], stop_reason: str
+) -> None:
+    consumer, stub = setup
+    _background(consumer)
+    _final(consumer, [ChatMessageUser(content=PROMPT)], stop_reason)
+    assert stub.ends() == []
+
+
+def test_cli_consumer_does_not_close_on_final_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _TranscriptStub()
+    monkeypatch.setattr(consumer_module, "transcript", lambda: stub)
+    monkeypatch.setattr(consumer_module, "current_span_id", lambda: "outer")
+    consumer = LiveConsumer()
+    _launch(consumer)
+    _final(consumer, [ChatMessageUser(content=PROMPT)])
+    assert stub.ends() == []
+
+
+def test_foreground_result_after_reply_close_is_noop(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    _final(consumer, [ChatMessageUser(content=PROMPT)])
+    _parent(consumer, ChatMessageTool(content="21 lines.", tool_call_id="toolu_1"))
+    assert stub.ends() == ["agent-toolu_1"]
+
+
+def test_nested_final_reply_closes_only_its_own_span(
+    setup: tuple[LiveConsumer, _TranscriptStub],
+) -> None:
+    consumer, stub = setup
+    _launch(consumer)
+    child_prompt = "Count the groups in /etc/group and report the number."
+    _call(
+        consumer,
+        [ChatMessageUser(content=PROMPT)],
+        [ToolCall(id="toolu_2", function="Agent", arguments={"prompt": child_prompt})],
+    )
+    assert stub.begins()[-1] == "agent-toolu_2"
+    _final(consumer, [ChatMessageUser(content=child_prompt)])
+    assert stub.ends() == ["agent-toolu_2"]
